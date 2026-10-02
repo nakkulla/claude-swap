@@ -781,6 +781,14 @@ class SessionManager:
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
+            # A `cswap session login` may have marked the profile while the
+            # probe ran: it is no longer a copy to reuse.
+            own_state = own_login_state(session_dir)
+            if own_state is not None:
+                return self._setup_own_login_session(
+                    session_dir, account_num, email, org_uuid, own_state,
+                    share, share_history,
+                )
             self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
@@ -853,7 +861,17 @@ class SessionManager:
                 )
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
-            # Re-evaluate the marker under the lock, then re-check validity:
+            # `cswap session login` writes its marker under this lock, and may
+            # have done so while this run probed and refreshed outside it. A
+            # marked profile never reaches the invalidate/bootstrap/cleanup
+            # below; `_setup_own_login_session` takes no cswap lock.
+            own_state = own_login_state(session_dir)
+            if own_state is not None:
+                return self._setup_own_login_session(
+                    session_dir, account_num, email, org_uuid, own_state,
+                    share, share_history,
+                )
+            # Re-evaluate the stale marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
                 self.switcher._invalidate_session_credentials(account_num, email)
@@ -971,14 +989,24 @@ class SessionManager:
         left ``pending``, which keeps the profile out of every sync path and
         refused by `run` until a retry or `cswap session logout` settles it.
         """
-        from claude_swap import oauth as _oauth
-
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        auth_lock = self._acquire_session_auth_lock(account_num, email)
+        try:
+            return self._login_locked(claude_bin, account_num, email, org_uuid)
+        finally:
+            auth_lock.release()
+
+    def _login_locked(
+        self, claude_bin: str, account_num: str, email: str, org_uuid: str
+    ) -> tuple[str, str]:
+        """Body of ``login``; caller holds the slot's session auth lock."""
+        from claude_swap import oauth as _oauth
+
         if self.switcher._account_kind(account_num) == "api_key":
             raise SessionError(
                 f"Account-{account_num} ({email}) is an API-key account; "
@@ -1088,9 +1116,17 @@ class SessionManager:
         The next `cswap run` seeds the profile from the backup again. Returns
         ``(account_num, email)``.
         """
+        account_num, email, _org_uuid = self.switcher.resolve_account(identifier)
+        auth_lock = self._acquire_session_auth_lock(account_num, email)
+        try:
+            return self._logout_locked(account_num, email)
+        finally:
+            auth_lock.release()
+
+    def _logout_locked(self, account_num: str, email: str) -> tuple[str, str]:
+        """Body of ``logout``; caller holds the slot's session auth lock."""
         from claude_swap import oauth as _oauth
 
-        account_num, email, _org_uuid = self.switcher.resolve_account(identifier)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
         if own_login_state(session_dir) is None:
             raise SessionError(
@@ -1131,6 +1167,26 @@ class SessionManager:
             clear_own_login_marker(session_dir)
         self._logger.info(f"Logged out account {account_num}'s session login")
         return account_num, email
+
+    def _acquire_session_auth_lock(self, account_num: str, email: str) -> FileLock:
+        """Take the slot's `session login`/`logout` lock without waiting.
+
+        Held for the whole operation, browser login included, so a logout can
+        never clear the marker under a login that is about to land a new
+        family. Always taken before ``lock_file``, never inside it. The kernel
+        drops it with the process, so a killed login leaves ``pending`` that
+        the next login or logout can settle.
+        """
+        lock = FileLock(
+            self.switcher.credentials_dir / f".session-login-{account_num}.lock"
+        )
+        if not lock.acquire(timeout=0):
+            raise SessionError(
+                f"Another `cswap session login` or `cswap session logout` for "
+                f"Account-{account_num} ({email}) is already in progress. Wait "
+                f"for it to finish (or end it), then retry."
+            )
+        return lock
 
     def _claude_auth_logout(self, claude_bin: str, session_dir: Path) -> None:
         """Best-effort `claude auth logout` inside the profile."""

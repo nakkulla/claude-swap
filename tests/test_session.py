@@ -2893,6 +2893,11 @@ def _profile(switcher) -> Path:
     return session_dir_for(switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
 
 
+def _auth_lock_path(switcher) -> Path:
+    """The slot's `cswap session login/logout` serialization lock."""
+    return switcher.credentials_dir / f".session-login-{ACCOUNT_NUM}.lock"
+
+
 def _seed_marked_profile(
     switcher, state: str | None, creds: str = OWN_CREDS
 ) -> Path:
@@ -3112,6 +3117,132 @@ class TestOwnLoginSetupSession:
         assert session_mod.own_login_state(session_dir) == "own"
 
 
+class TestOwnLoginMarkedMidSetup:
+    """gate-r1 finding 1: `cswap session login` can mark the profile after
+    setup_session's first marker read — while it probes, refreshes or waits
+    for the lock. The marked profile must still never be reused as a copy,
+    re-seeded, invalidated or cleaned up."""
+
+    @pytest.fixture
+    def destructive_calls(self, monkeypatch):
+        """Records (and still runs) every path that rewrites or deletes the
+        profile's credential material."""
+        calls: list[str] = []
+
+        def spy(cls, name):
+            original = getattr(cls, name)
+
+            def wrapper(self, *a, **k):
+                calls.append(name)
+                return original(self, *a, **k)
+
+            monkeypatch.setattr(cls, name, wrapper)
+
+        spy(SessionManager, "_bootstrap")
+        spy(SessionManager, "_cleanup_failed_session")
+        spy(ClaudeAccountSwitcher, "_invalidate_session_credentials")
+        return calls
+
+    def test_pending_marked_during_the_unlocked_reuse_probe_is_refused(
+        self, manager, seeded_switcher, fake_claude, no_gate,
+        destructive_calls, block_real_keychain, monkeypatch,
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, None, CREDS)
+        service = keychain_service_name(session_dir)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, CREDS)
+
+        def probe_then_login_marks(self, path, email, org):
+            session_mod.write_own_login_marker(path, "pending", email, org)
+            return True
+
+        monkeypatch.setattr(
+            SessionManager, "_is_session_valid", probe_then_login_marks
+        )
+
+        with pytest.raises(SessionError, match="has not finished"):
+            manager.setup_session("2", share=False)
+
+        assert destructive_calls == []
+        assert no_gate == []
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+        assert block_real_keychain.get_password(service, account) == CREDS
+        assert session_mod.own_login_state(session_dir) == "pending"
+
+    @staticmethod
+    def _login_marks_during_refresh(monkeypatch, state, land_family):
+        """The pre-lock refresh is where a concurrent `session login` slips
+        in: it writes its marker (and maybe lands its family) before this run
+        takes the lock."""
+
+        def gate(self, num, email, snap):
+            session_dir = self._session_dir(num, email)
+            session_mod.write_own_login_marker(session_dir, state, email, ORG_UUID)
+            if land_family:
+                (session_dir / ".credentials.json").write_text(OWN_CREDS)
+            return oauth.RefreshOutcome(None, "transient")
+
+        monkeypatch.setattr(ClaudeAccountSwitcher, "consume_backup_grant", gate)
+
+    @pytest.mark.parametrize("scenario", ["stale_copy", "logged_out"])
+    def test_pending_marked_before_the_lock_is_refused_untouched(
+        self, manager, seeded_switcher, fake_claude, destructive_calls,
+        block_real_keychain, monkeypatch, scenario,
+    ):
+        """``stale_copy`` heads for invalidate + re-seed, ``logged_out`` for
+        bootstrap + failed-validation cleanup (rmtree)."""
+        service = keychain_service_name(_profile(seeded_switcher))
+        account = session_mod._keychain_account_name()
+        if scenario == "stale_copy":
+            session_dir = _seed_marked_profile(seeded_switcher, None, CREDS)
+            _mark_stale(session_dir)
+            block_real_keychain.set_password(service, account, OWN_CREDS)
+            self._login_marks_during_refresh(monkeypatch, "pending", True)
+        else:
+            session_dir = _seed_marked_profile(seeded_switcher, None, CREDS)
+            (session_dir / ".credentials.json").unlink()
+            fake_claude.status_valid = False
+            self._login_marks_during_refresh(monkeypatch, "pending", False)
+
+        with pytest.raises(SessionError, match="has not finished"):
+            manager.setup_session("2", share=False)
+
+        assert destructive_calls == []
+        assert session_mod.own_login_state(session_dir) == "pending"
+        assert (session_dir / ".claude.json").exists()
+        if scenario == "stale_copy":
+            assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+            assert block_real_keychain.get_password(service, account) == OWN_CREDS
+        else:
+            assert not (session_dir / ".credentials.json").exists()
+            assert block_real_keychain.get_password(service, account) is None
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+
+    def test_own_marked_before_the_lock_takes_the_verify_path(
+        self, manager, seeded_switcher, fake_claude, destructive_calls,
+        block_real_keychain, monkeypatch,
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, None, CREDS)
+        _mark_stale(session_dir)
+        service = keychain_service_name(session_dir)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, OWN_CREDS)
+        self._login_marks_during_refresh(monkeypatch, "own", True)
+
+        got = manager.setup_session("2", share=False)
+
+        assert got == (session_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        assert destructive_calls == []
+        assert session_mod.own_login_state(session_dir) == "own"
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+        assert block_real_keychain.get_password(service, account) == OWN_CREDS
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+
+
 class TestOwnLoginRun:
     """§5 item 7: an own login always runs in its profile; pending refuses."""
 
@@ -3313,13 +3444,15 @@ class TestSessionLogin:
     ):
         """A copied profile ahead of the backup is absorbed (pure store write)
         and the marker written in ONE section of the non-reentrant lock; the
-        flip to `own` takes a second section after the login."""
+        flip to `own` takes a second section after the login. The slot's
+        session auth lock wraps both, taken first and released last."""
         session_dir = _seed_marked_profile(seeded_switcher, None, ROTATED_CREDS)
         _ReentryGuardLock.held = set()
         _ReentryGuardLock.events = events = []
         monkeypatch.setattr(session_mod, "FileLock", _ReentryGuardLock)
         monkeypatch.setattr("claude_swap.switcher.FileLock", _ReentryGuardLock)
         lock = str(seeded_switcher.lock_file)
+        auth = str(_auth_lock_path(seeded_switcher))
 
         store_write = seeded_switcher._store._write_account_credentials
 
@@ -3348,6 +3481,7 @@ class TestSessionLogin:
         manager.login("2")
 
         assert events == [
+            ("acquire", auth),
             ("acquire", lock),
             ("absorb", ROTATED_CREDS, True),
             ("marker", "pending", True),
@@ -3355,6 +3489,7 @@ class TestSessionLogin:
             ("acquire", lock),
             ("marker", "own", True),
             ("release", lock),
+            ("release", auth),
         ]
         assert seeded_switcher.read_account_credentials(
             ACCOUNT_NUM, ACCOUNT_EMAIL
@@ -3605,3 +3740,159 @@ class TestSessionLogout:
             manager.logout("2")
 
         assert session_mod.own_login_state(session_dir) == "own"
+
+
+class TestSessionAuthLock:
+    """gate-r1 finding 2: `session login` and `session logout` of one slot
+    are serialized end to end by a non-blocking per-slot lock, taken before
+    the global lock and held across the browser login."""
+
+    @pytest.fixture
+    def held_auth_lock(self, seeded_switcher):
+        """Another `session login/logout` holding the slot's lock."""
+        from claude_swap.locking import FileLock
+
+        lock = FileLock(_auth_lock_path(seeded_switcher))
+        assert lock.acquire(timeout=0)
+        yield lock
+        lock.release()
+
+    @pytest.fixture
+    def opened_locks(self, monkeypatch):
+        """Paths of every FileLock session.py constructs."""
+        real = session_mod.FileLock
+        opened: list[str] = []
+
+        def recording(path, *a, **k):
+            opened.append(str(path))
+            return real(path, *a, **k)
+
+        monkeypatch.setattr(session_mod, "FileLock", recording)
+        return opened
+
+    @pytest.mark.parametrize("state", [None, "pending", "own"])
+    @pytest.mark.parametrize("op", ["login", "logout"])
+    def test_refuses_while_another_holds_the_slot(
+        self, manager, seeded_switcher, fake_claude, held_auth_lock,
+        opened_locks, block_real_keychain, monkeypatch, op, state,
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, state)
+        marker = session_dir / session_mod.OWN_LOGIN_MARKER
+        marker_before = marker.read_text() if state else None
+        config_before = (session_dir / ".claude.json").read_text()
+        service = keychain_service_name(session_dir)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, OWN_CREDS)
+        live_checks: list[str] = []
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_ensure_no_live_session",
+            lambda self, *a: live_checks.append(a[-1]),
+        )
+
+        with pytest.raises(SessionError) as exc:
+            getattr(manager, op)("2")
+
+        msg = str(exc.value)
+        assert "already in progress" in msg
+        assert "Account-2" in msg
+        assert opened_locks == [str(_auth_lock_path(seeded_switcher))]
+        assert live_checks == []
+        assert fake_claude.calls == []
+        assert session_mod.own_login_state(session_dir) == state
+        if state:
+            assert marker.read_text() == marker_before
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+        assert (session_dir / ".claude.json").read_text() == config_before
+        assert block_real_keychain.get_password(service, account) == OWN_CREDS
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+
+    def test_logout_during_the_browser_login_is_refused_and_own_stands(
+        self, manager, seeded_switcher, monkeypatch
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, None, CREDS)
+        inner = FakeClaude()
+        attempts: list[tuple[str | None, str | None]] = []
+
+        def run(cmd, env=None, **kwargs):
+            if tuple(cmd[1:3]) == ("auth", "login"):
+                try:
+                    SessionManager(seeded_switcher).logout("2")
+                except SessionError as e:
+                    attempts.append((str(e), session_mod.own_login_state(session_dir)))
+                else:
+                    attempts.append((None, session_mod.own_login_state(session_dir)))
+            return inner(cmd, env=env, **kwargs)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", run)
+        monkeypatch.setattr(session_mod.shutil, "which", lambda n: f"/fake/bin/{n}")
+
+        assert manager.login("2") == (ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+        assert len(attempts) == 1
+        refusal, state_then = attempts[0]
+        assert refusal is not None and "already in progress" in refusal
+        assert state_then == "pending"
+        assert ("auth", "logout") not in inner.args()
+        assert session_mod.own_login_state(session_dir) == "own"
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+
+    @pytest.mark.parametrize("op", ["login", "logout"])
+    def test_a_released_lock_lets_a_pending_profile_settle(
+        self, manager, seeded_switcher, fake_claude, held_auth_lock, op
+    ):
+        """The lock dies with its holder (a killed login), so the `pending`
+        it left is settled by the next login or logout."""
+        session_dir = _seed_marked_profile(seeded_switcher, "pending", CREDS)
+        with pytest.raises(SessionError, match="already in progress"):
+            getattr(manager, op)("2")
+
+        held_auth_lock.release()  # the holder process exited
+
+        assert getattr(manager, op)("2") == (ACCOUNT_NUM, ACCOUNT_EMAIL)
+        expected = "own" if op == "login" else None
+        assert session_mod.own_login_state(session_dir) == expected
+
+    def test_a_failed_login_releases_the_lock(
+        self, manager, seeded_switcher, fake_claude
+    ):
+        session_dir = _profile(seeded_switcher)
+        fake_claude.login = "cancel"
+        with pytest.raises(SessionError, match="has not finished"):
+            manager.login("2")
+
+        manager.logout("2")
+
+        assert session_mod.own_login_state(session_dir) is None
+
+    def test_logout_takes_the_auth_lock_outside_the_global_lock(
+        self, manager, seeded_switcher, fake_claude, monkeypatch
+    ):
+        _seed_marked_profile(seeded_switcher, "own")
+        _ReentryGuardLock.held = set()
+        _ReentryGuardLock.events = events = []
+        monkeypatch.setattr(session_mod, "FileLock", _ReentryGuardLock)
+        monkeypatch.setattr("claude_swap.switcher.FileLock", _ReentryGuardLock)
+        lock = str(seeded_switcher.lock_file)
+        auth = str(_auth_lock_path(seeded_switcher))
+        inner = fake_claude.__call__
+
+        def run(cmd, env=None, **kwargs):
+            events.append(
+                ("claude", tuple(cmd[1:3]), auth in _ReentryGuardLock.held,
+                 lock in _ReentryGuardLock.held)
+            )
+            return inner(cmd, env=env, **kwargs)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", run)
+
+        manager.logout("2")
+
+        assert events == [
+            ("acquire", auth),
+            ("claude", ("auth", "logout"), True, False),
+            ("acquire", lock),
+            ("release", lock),
+            ("release", auth),
+        ]
