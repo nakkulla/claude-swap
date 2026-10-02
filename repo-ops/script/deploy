@@ -1,0 +1,100 @@
+#!/bin/sh
+set -eu
+
+fail() {
+    printf 'repo-ops deploy: %s\n' "$*" >&2
+    exit 1
+}
+
+exec </dev/null
+
+: "${REPO_OPS_TARGET_SHA:?REPO_OPS_TARGET_SHA is required}"
+: "${REPO_OPS_TARGET_BASE:?REPO_OPS_TARGET_BASE is required}"
+: "${REPO_OPS_REPO_ROOT:?REPO_OPS_REPO_ROOT is required}"
+
+case "$REPO_OPS_TARGET_SHA" in
+    *[!0-9a-f]*|'') fail "REPO_OPS_TARGET_SHA must be a lowercase hex SHA" ;;
+esac
+[ "${#REPO_OPS_TARGET_SHA}" -eq 40 ] || fail "REPO_OPS_TARGET_SHA must be 40 hex characters"
+
+repo_root="$(cd "$REPO_OPS_REPO_ROOT" && pwd -P)" || fail "REPO_OPS_REPO_ROOT is unavailable"
+cwd="$(pwd -P)"
+[ "$cwd" = "$repo_root" ] || fail "cwd must equal REPO_OPS_REPO_ROOT"
+
+# Re-exec under a Python-owned flock that every child inherits, so two deploys
+# never overlap (macOS has no flock(1)). The lockfile path is one literal because
+# the contract's activation gate searches this script's bytes for
+# `.worktrees/.repo-ops-deploy.lock`.
+if [ "${REPO_OPS_DEPLOY_LOCKED:-}" != "1" ]; then
+    common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)" ||
+        fail "cannot resolve the main repository directory"
+    lock_file="$(dirname "$common_dir")/.worktrees/.repo-ops-deploy.lock"
+    exec python3 -c '
+import fcntl
+import os
+import sys
+
+script = sys.argv[1]
+lock_file = sys.argv[2]
+os.makedirs(os.path.dirname(lock_file), exist_ok=True)
+fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.set_inheritable(fd, True)
+env = dict(os.environ)
+env["REPO_OPS_DEPLOY_LOCKED"] = "1"
+os.execve(script, [script, *sys.argv[3:]], env)
+' "$0" "$lock_file" "$@"
+fi
+
+read_head() {
+    git -C "$repo_root" rev-parse --verify 'HEAD^{commit}'
+}
+
+tracked_clean() {
+    tracked_status="$(git -C "$repo_root" status --porcelain=v1 --untracked-files=no)" || return 1
+    [ -z "$tracked_status" ]
+}
+
+start_head="$(read_head)" || fail "start HEAD is unreadable"
+[ "$start_head" = "$REPO_OPS_TARGET_SHA" ] || fail "start HEAD differs from REPO_OPS_TARGET_SHA"
+tracked_clean || fail "tracked worktree is dirty before install"
+
+command -v uv >/dev/null 2>&1 || fail "uv is not available"
+
+# Non-editable install from this checkout: the installed cswap must not depend on
+# the checkout staying on this commit afterwards.
+uv tool install --force --reinstall "$repo_root" >/dev/null 2>&1 || fail "uv tool install failed"
+
+# Readback resolves cswap and the tool python through uv, never through PATH order.
+bin_dir="$(uv tool dir --bin)" || fail "cannot resolve uv tool bin dir"
+tool_dir="$(uv tool dir)" || fail "cannot resolve uv tool dir"
+cswap_bin="$bin_dir/cswap"
+tool_python="$tool_dir/claude-swap/bin/python"
+[ -x "$cswap_bin" ] || fail "readback: installed cswap is missing"
+[ -x "$tool_python" ] || fail "readback: installed tool python is missing"
+
+"$cswap_bin" session --help >/dev/null 2>&1 || fail "readback: installed cswap session --help failed"
+
+"$tool_python" - "$repo_root" >/dev/null 2>&1 <<'PY' || fail "readback: install source is not this checkout"
+import json
+import os
+import sys
+from importlib.metadata import distribution
+from urllib.parse import unquote, urlparse
+
+expected = os.path.realpath(sys.argv[1])
+raw = distribution("claude-swap").read_text("direct_url.json")
+info = json.loads(raw)
+if info.get("dir_info", {}).get("editable"):
+    sys.exit(1)
+url = urlparse(info["url"])
+if url.scheme != "file" or os.path.realpath(unquote(url.path)) != expected:
+    sys.exit(1)
+PY
+
+end_head="$(read_head)" || fail "end HEAD is unreadable"
+[ "$end_head" = "$REPO_OPS_TARGET_SHA" ] || fail "end HEAD differs from REPO_OPS_TARGET_SHA"
+tracked_clean || fail "tracked worktree is dirty after deploy"
+
+printf 'repo-ops deploy ok: base=%s target=%s\n' "$REPO_OPS_TARGET_BASE" "$REPO_OPS_TARGET_SHA"
+exit 0

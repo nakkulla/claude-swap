@@ -10,8 +10,9 @@ upstream이 정본이다.
   `main`에 merge하는 커밋 하나로 한다. rebase나 force-push로 이력을 다시 쓰지 않는다.
 - fork 고유 변경은 작게, 기존 모듈 안에서 끝낸다. upstream 파일의 대규모 재배치·
   포맷 변경은 merge 충돌만 늘리므로 하지 않는다.
-- fork 전용 파일은 `AGENTS.md`, `CLAUDE.md`, `docs/`로 한정한다. upstream에 PR을
-  보낼 때는 이 파일들을 뺀 별도 브랜치를 쓴다.
+- fork 전용 파일은 `AGENTS.md`, `CLAUDE.md`, `docs/`, `repo-ops/`,
+  `tests/test_repo_ops_deploy.py`로 한정한다. upstream에 PR을 보낼 때는 이 파일들을 뺀
+  별도 브랜치를 쓴다.
 - `.beads/`는 `bd init`의 fork 보호로 `.git/info/exclude`에 들어가 커밋하지 않는다.
   Beads 데이터는 중앙 dolt(`claude_swap` DB)에 있고, worktree의 `bd`는 이 checkout의
   `.beads`를 찾아 쓴다.
@@ -20,8 +21,10 @@ upstream이 정본이다.
 
 - `uv`만 쓴다. 환경은 `uv sync --locked`로 repo-local `.venv`에 만들고, 실행은
   `uv run ...`으로 한다. 시스템 python·pip 직접 설치는 쓰지 않는다.
-- 실제로 설치된 `cswap`은 `uv tool`로 PyPI 버전을 설치한 별도 사본이다. fork를
-  설치본으로 바꾸는 일은 승인된 스펙의 배포 절차로만 한다.
+- 실제로 설치된 `cswap`은 착지한 `main`을 `repo-ops/script/deploy`가
+  `.worktrees/.repo-ops-deploy` checkout에서 `uv tool install`(비편집)로 설치한 사본이다
+  (머지 뒤 Worker가 실행). 수동 설치도 그 checkout과 스크립트만 쓰고, 일회성 구현
+  worktree에서는 설치하지 않는다.
 
 ## 검증
 
