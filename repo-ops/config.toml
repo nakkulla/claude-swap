@@ -1,0 +1,11 @@
+# 저장소 운영 선언. 선언 형식의 소유자는 dotfiles `docs/contracts/workflow-contract.md` 이며
+# 이 파일은 그 계약을 재서술하지 않고 이 레포의 값만 채운다.
+#
+# 최상위 키는 base·verify·deploy 뿐이고, 각 operation 표는 script 와 timeout_ms 만 갖는다.
+base = "main"
+
+# `[deploy]` 는 착지한 SHA 의 이 checkout 을 `uv tool install` 로 비편집 설치해 `cswap` 을 갱신한다.
+# 실행자는 이전 target-base 커밋의 tracked blob 을 읽으므로 착지 다음 머지부터 발효된다.
+[deploy]
+script = "repo-ops/script/deploy"
+timeout_ms = 600000

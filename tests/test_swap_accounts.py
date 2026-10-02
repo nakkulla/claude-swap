@@ -540,3 +540,57 @@ class TestSwapUnreadableSourceIsNotAbsent:
         data = switcher._get_sequence_data()
         assert data["accounts"]["1"]["email"] == "account2@example.com"
         assert data["accounts"]["2"]["email"] == "account1@example.com"
+
+
+class TestSwapRefusesOwnLoginProfiles:
+    """§5 item 11: swapping an account whose profile has its own login is
+    refused before anything changes, whichever side it is on."""
+
+    EMAIL = "account2@example.com"
+
+    @pytest.mark.parametrize("order", [("1", "2"), ("2", "1")])
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_marked_account_is_refused_before_anything_changes(
+        self, temp_home: Path, sample_sequence_data: dict, block_real_keychain,
+        state, order,
+    ):
+        from claude_swap.exceptions import SessionError
+        from claude_swap.session import (
+            _keychain_account_name,
+            keychain_service_name,
+            own_login_state,
+            write_own_login_marker,
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        switcher._write_account_credentials("1", "account1@example.com", "rt-1")
+        switcher._write_account_credentials("2", self.EMAIL, "backup-rt")
+        other = switcher._session_dir("1", "account1@example.com")
+        other.mkdir(parents=True)
+        (other / "history.txt").write_text("account one")
+        profile = switcher._session_dir("2", self.EMAIL)
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text("own-family")
+        write_own_login_marker(profile, state, self.EMAIL, "")
+        item = (keychain_service_name(profile), _keychain_account_name())
+        block_real_keychain.set_password(*item, "own-family")
+        # The one-time org-field migration runs first either way; what
+        # must not change is everything after it.
+        switcher._get_sequence_data_migrated()
+        before = switcher._get_sequence_data()
+
+        with pytest.raises(SessionError, match="cswap session logout 2"):
+            switcher.swap_accounts(*order)
+
+        assert switcher._get_sequence_data() == before
+        assert own_login_state(profile) == state
+        assert (profile / ".credentials.json").read_text() == "own-family"
+        assert block_real_keychain.get_password(*item) == "own-family"
+        assert (other / "history.txt").read_text() == "account one"
+        assert switcher._read_account_credentials("2", self.EMAIL) == "backup-rt"
+        assert (
+            switcher._read_account_credentials("1", "account1@example.com")
+            == "rt-1"
+        )

@@ -318,6 +318,7 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     login_expires_at: str | None = None,
+    session_login: str | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -343,6 +344,10 @@ def account_row(
     # ``relogin_required`` that follows; absent when the login carries none.
     if login_expires_at:
         row["loginExpiresAt"] = login_expires_at
+    # Additive field: ``"own"``/``"pending"`` only when the slot's session
+    # profile has its own login (``cswap session login``).
+    if session_login:
+        row["sessionLogin"] = session_login
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

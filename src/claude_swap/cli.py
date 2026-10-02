@@ -231,6 +231,65 @@ Examples:
         sys.exit(130)
 
 
+def _session_command(argv: list[str]) -> None:
+    """Handle `cswap session login|logout NUM|EMAIL`.
+
+    Gives an account's session profile a login of its own (a separate token
+    family that cswap never syncs with the backup or the default login), or
+    drops it again. Pre-dispatched for the same reason as `run`.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} session",
+        description=(
+            "Manage a session profile's own login. With its own login, the "
+            "account's `cswap run` sessions keep working while the default "
+            "login is switched to the same account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap session login 2
+  cswap session logout user@example.com
+        """,
+    )
+    sub = parser.add_subparsers(dest="action", metavar="{login,logout}")
+    sub.required = True
+    for action, help_text in (
+        ("login", "Log the account's session profile in on its own (interactive)"),
+        ("logout", "Drop the session profile's own login (back to the shared copy)"),
+    ):
+        p = sub.add_parser(action, help=help_text)
+        p.add_argument("account", metavar="NUM|EMAIL", help="Account (number or email)")
+        p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        from claude_swap.session import SessionManager
+
+        manager = SessionManager(switcher)
+        if args.action == "login":
+            num, email = manager.login(args.account)
+            print(
+                f"{accent('Logged in')} Account-{num} ({email})'s session "
+                "profile on its own login"
+            )
+        else:
+            num, email = manager.logout(args.account)
+            print(
+                f"{accent('Logged out')} Account-{num} ({email})'s session "
+                "login; the next `cswap run` uses the shared copy again"
+            )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
     """Refuse to run as root outside a container (shared by run/map/unmap)."""
     if sys.platform != "win32":
@@ -998,6 +1057,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "session":
+        _session_command(argv[1:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1049,6 +1111,8 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s session login <num|email>  give an account's session its own login
+  %(prog)s session logout <num|email> drop a session's own login
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping

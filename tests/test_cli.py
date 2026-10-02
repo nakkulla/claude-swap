@@ -850,6 +850,151 @@ class TestRunCommand:
         assert "boom" in capsys.readouterr().err
 
 
+class TestSessionCommand:
+    """`cswap session login|logout` (§5 items 8 and 9, CLI side)."""
+
+    EMAIL = "work@co.com"
+
+    def _seed(self):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": self.EMAIL,
+            "uuid": "u2",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        switcher._write_account_credentials("2", self.EMAIL, json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-backup", "refreshToken": "rt-backup",
+                              "expiresAt": 1},
+        }))
+        switcher._write_account_config("2", self.EMAIL, json.dumps({
+            "oauthAccount": {"emailAddress": self.EMAIL, "accountUuid": "u2"},
+        }))
+        return switcher
+
+    def _fake_claude(self, calls: list, login_rc: int = 0):
+        def fake_run(cmd, env=None, **kwargs):
+            calls.append(tuple(cmd[1:3]))
+            profile = Path(env["CLAUDE_CONFIG_DIR"])
+            if cmd[1:3] == ["auth", "login"]:
+                if login_rc == 0:
+                    (profile / ".credentials.json").write_text(json.dumps({
+                        "claudeAiOauth": {"accessToken": "sk-own",
+                                          "refreshToken": "rt-own",
+                                          "expiresAt": 9999999999999},
+                    }))
+                return MagicMock(returncode=login_rc, stdout="", stderr="")
+            if cmd[1:3] == ["auth", "logout"]:
+                (profile / ".credentials.json").unlink(missing_ok=True)
+                return MagicMock(returncode=0, stdout="", stderr="")
+            logged_in = (profile / ".credentials.json").exists()
+            payload = (
+                {"loggedIn": True, "authMethod": "claude.ai", "email": self.EMAIL}
+                if logged_in else {"loggedIn": False}
+            )
+            return MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        return fake_run
+
+    def _main(self, argv: list[str], fake_run):
+        with patch("claude_swap.session.subprocess.run", side_effect=fake_run), \
+             patch("claude_swap.session.shutil.which", return_value="/fake/claude"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+
+    def test_login_then_logout_end_to_end(self, temp_home, capsys):
+        from claude_swap.session import own_login_state
+
+        switcher = self._seed()
+        profile = switcher._session_dir("2", self.EMAIL)
+        calls: list = []
+
+        self._main(["session", "login", "2"], self._fake_claude(calls))
+        assert own_login_state(profile) == "own"
+        assert "Logged in" in capsys.readouterr().out
+
+        self._main(["session", "logout", self.EMAIL], self._fake_claude(calls))
+        assert own_login_state(profile) is None
+        assert not (profile / ".credentials.json").exists()
+        assert "Logged out" in capsys.readouterr().out
+        assert ("auth", "login") in calls and ("auth", "logout") in calls
+
+    def test_failed_login_exits_1_and_stays_pending(self, temp_home, capsys):
+        from claude_swap.session import own_login_state
+
+        switcher = self._seed()
+        calls: list = []
+
+        with pytest.raises(SystemExit) as exc:
+            self._main(["session", "login", "2"], self._fake_claude(calls, login_rc=1))
+
+        assert exc.value.code == 1
+        assert own_login_state(switcher._session_dir("2", self.EMAIL)) == "pending"
+        assert "cswap session logout 2" in capsys.readouterr().err
+
+    def test_login_refuses_a_live_session(self, temp_home, capsys):
+        switcher = self._seed()
+        profile = switcher._session_dir("2", self.EMAIL)
+        (profile / "sessions").mkdir(parents=True)
+        (profile / "sessions" / f"{os.getpid()}.json").write_text(
+            json.dumps({"pid": os.getpid()})
+        )
+        calls: list = []
+
+        with pytest.raises(SystemExit) as exc:
+            self._main(["session", "login", "2"], self._fake_claude(calls))
+
+        assert exc.value.code == 1
+        assert calls == []
+        assert "live session-mode" in capsys.readouterr().err
+
+    def test_login_refuses_an_api_key_account(self, temp_home, capsys):
+        switcher = self._seed()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        switcher._write_json(switcher.sequence_file, data)
+        calls: list = []
+
+        with pytest.raises(SystemExit) as exc:
+            self._main(["session", "login", "2"], self._fake_claude(calls))
+
+        assert exc.value.code == 1
+        assert calls == []
+        assert "API-key account" in capsys.readouterr().err
+
+    def test_logout_without_a_session_login_exits_1(self, temp_home, capsys):
+        self._seed()
+        calls: list = []
+
+        with pytest.raises(SystemExit) as exc:
+            self._main(["session", "logout", "2"], self._fake_claude(calls))
+
+        assert exc.value.code == 1
+        assert calls == []
+
+    def test_missing_action_is_a_usage_error(self):
+        with patch.object(sys, "argv", ["claude-swap", "session"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+
+    def test_main_help_mentions_session_login(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "session login <num|email>" in result.stdout
+
+
 class TestSubcommandAliases:
     """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
 

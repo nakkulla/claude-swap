@@ -12486,3 +12486,278 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestOwnLoginLineageBoundary:
+    """A session profile with its own login (``cswap session login``) holds a
+    token family of its own: no sync path may copy it into the backup, and
+    none may overwrite it from the backup (§5 items 1, 3, 4, 6)."""
+
+    EMAIL = "account2@example.com"
+    # The backup's family: an older generation, so a copied profile holding
+    # PROFILE would read as "ahead" and be adopted if it were unmarked.
+    BACKUP = _oauth_creds("sk-backup", -3600)
+    PROFILE = _oauth_creds("sk-own", 7200)
+
+    def _switcher(self, sample_sequence_data, monkeypatch, platform=Platform.MACOS):
+        monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: platform))
+        s = ClaudeAccountSwitcher()
+        s.platform = platform
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        s._write_account_credentials("2", self.EMAIL, self.BACKUP)
+        s._write_account_config("2", self.EMAIL, json.dumps({
+            "oauthAccount": {"emailAddress": self.EMAIL, "accountUuid": "uuid-2"},
+        }))
+        return s
+
+    def _profile(self, s, state, creds=None) -> Path:
+        from claude_swap.session import write_own_login_marker
+
+        d = s._session_dir("2", self.EMAIL)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ".credentials.json").write_text(creds or self.PROFILE)
+        (d / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": self.EMAIL, "accountUuid": "uuid-2"},
+        }))
+        if state is not None:
+            write_own_login_marker(d, state, self.EMAIL, "")
+        return d
+
+    @staticmethod
+    def _make_live(d: Path) -> None:
+        records = d / "sessions"
+        records.mkdir(exist_ok=True)
+        (records / f"{os.getpid()}.json").write_text(json.dumps({"pid": os.getpid()}))
+
+    # -- item 1: backup changes never invalidate or mark a marked profile ----
+
+    @pytest.mark.parametrize("live", [False, True])
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_backup_write_leaves_a_marked_profile_alone(
+        self, temp_home, sample_sequence_data, monkeypatch, block_real_keychain,
+        state, live,
+    ):
+        from claude_swap.session import (
+            _keychain_account_name,
+            is_session_stale,
+            keychain_service_name,
+            own_login_state,
+        )
+
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        d = self._profile(s, state)
+        if live:
+            self._make_live(d)
+        service = keychain_service_name(d)
+        block_real_keychain.set_password(service, _keychain_account_name(), self.PROFILE)
+
+        s._write_account_credentials("2", self.EMAIL, _oauth_creds("sk-readd", 9000))
+
+        assert (d / ".credentials.json").read_text() == self.PROFILE
+        assert block_real_keychain.get_password(
+            service, _keychain_account_name()
+        ) == self.PROFILE
+        assert not is_session_stale(d)
+        assert own_login_state(d) == state
+
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_invalidate_is_a_no_op_on_a_marked_profile(
+        self, temp_home, sample_sequence_data, monkeypatch, state
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        d = self._profile(s, state)
+
+        s._invalidate_session_credentials("2", self.EMAIL)
+
+        assert (d / ".credentials.json").read_text() == self.PROFILE
+
+    # -- item 3: refresh gate, ahead check and adoption ----------------------
+
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_profile_is_never_ahead_and_never_adopted(
+        self, temp_home, sample_sequence_data, monkeypatch, state
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        self._profile(s, state)
+
+        assert s._session_profile_ahead("2", self.EMAIL, "") is None
+        assert s._adopt_session_credential("2", self.EMAIL, "") is False
+        assert s.read_account_credentials("2", self.EMAIL) == self.BACKUP
+
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_refresh_gate_posts_the_backup_not_the_marked_profile(
+        self, temp_home, sample_sequence_data, monkeypatch, state
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        self._profile(s, state)
+        posted: list[str] = []
+
+        def refresh(creds, **kw):
+            posted.append(creds)
+            return oauth.RefreshOutcome(None, "transient")
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=refresh):
+            s.consume_backup_grant("2", self.EMAIL, self.BACKUP)
+
+        assert posted == [self.BACKUP]
+        assert s.read_account_credentials("2", self.EMAIL) == self.BACKUP
+
+    # -- item 4: _perform_switch neither refuses nor warns -------------------
+
+    def _direct_activation(self, s, monkeypatch):
+        monkeypatch.setattr(s, "_get_current_account", lambda: None)
+        monkeypatch.setattr(s, "list_accounts", lambda **kw: None)
+
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_live_marked_profile_ahead_switches_without_refusal_or_warning(
+        self, temp_home, sample_sequence_data, monkeypatch, capsys, state
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        d = self._profile(s, state)
+        self._make_live(d)
+        self._direct_activation(s, monkeypatch)
+
+        s._perform_switch("2")
+
+        assert "live session-mode" not in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+        # The backup's family is what got activated; the profile kept its own.
+        assert s._read_credentials() == self.BACKUP
+        assert s.read_account_credentials("2", self.EMAIL) == self.BACKUP
+        assert (d / ".credentials.json").read_text() == self.PROFILE
+
+    def test_quiescent_marked_profile_ahead_is_not_adopted_by_a_switch(
+        self, temp_home, sample_sequence_data, monkeypatch
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        self._profile(s, "own")
+        self._direct_activation(s, monkeypatch)
+
+        s._perform_switch("2")
+
+        assert s.read_account_credentials("2", self.EMAIL) == self.BACKUP
+        assert s._read_credentials() == self.BACKUP
+
+    @pytest.mark.parametrize(
+        "state, warned", [(None, True), ("pending", False), ("own", False)]
+    )
+    def test_json_switch_live_session_warning_only_for_unmarked(
+        self, temp_home, sample_sequence_data, monkeypatch, state, warned
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        d = self._profile(s, state, creds=self.BACKUP)  # live, not ahead
+        self._make_live(d)
+        self._direct_activation(s, monkeypatch)
+
+        result = s._perform_switch("2", emit_output=False)
+
+        assert bool(result["warnings"]) is warned
+        if warned:
+            assert "live session-mode" in result["warnings"][0]
+
+    # -- item 6: usage lookups ----------------------------------------------
+
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_usage_uses_the_backup_path_even_with_a_live_session(
+        self, temp_home, sample_sequence_data, monkeypatch, state
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        d = self._profile(s, state)
+        self._make_live(d)
+        info = (2, self.EMAIL, "", "", False, self.BACKUP, "")
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None)) as fetch:
+            s._fetch_account_usage(info)
+
+        args, kwargs = fetch.call_args
+        assert args[2] == self.BACKUP
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("refresh_via") is not None
+        assert s.read_account_credentials("2", self.EMAIL) == self.BACKUP
+        assert (d / ".credentials.json").read_text() == self.PROFILE
+
+    @pytest.mark.parametrize("state", [None, "pending", "own"])
+    def test_list_inside_a_marked_profile_writes_neither_store(
+        self, temp_home, sample_sequence_data, monkeypatch, state
+    ):
+        """CLAUDE_CONFIG_DIR at the profile makes its account the "active"
+        one and its credential the "live" one. For a marked profile that is
+        the profile's own family, so `list` only reads it; the unmarked case
+        is today's resync, kept as the control."""
+        s = self._switcher(sample_sequence_data, monkeypatch, Platform.LINUX)
+        d = self._profile(s, state)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(d))
+
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value={
+                 "uuid": "uuid-2", "email": self.EMAIL, "organizationUuid": None,
+             }), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=AssertionError("no refresh")), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            payload = s.list_accounts(json_output=True)
+
+        assert payload["activeAccountNumber"] == 2
+        if state is None:
+            assert s.read_account_credentials("2", self.EMAIL) == self.PROFILE
+        else:
+            assert s.read_account_credentials("2", self.EMAIL) == self.BACKUP
+            assert (d / ".credentials.json").read_text() == self.PROFILE
+
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_expired_marked_active_credential_is_never_refreshed_or_restored(
+        self, temp_home, sample_sequence_data, monkeypatch, state
+    ):
+        """An expired "live" credential with a fresh slot backup is the
+        restore shape: unmarked, the backup would be written over the live
+        store — here the profile's own family."""
+        s = self._switcher(sample_sequence_data, monkeypatch, Platform.LINUX)
+        fresh_backup = _oauth_creds("sk-backup-fresh", 7200)
+        s._write_account_credentials("2", self.EMAIL, fresh_backup)
+        expired = _oauth_creds("sk-own-old", -60)
+        d = self._profile(s, state, creds=expired)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(d))
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=AssertionError("no refresh")), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   side_effect=AssertionError("no fetch")):
+            record = s._fetch_active_usage("2", self.EMAIL, expired, "")
+
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        assert s.read_account_credentials("2", self.EMAIL) == fresh_backup
+        assert (d / ".credentials.json").read_text() == expired
+
+    def test_default_login_resync_is_kept_for_an_account_with_a_marked_profile(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        """The read-only rule follows CLAUDE_CONFIG_DIR, not the account: the
+        default login of an account whose profile has its own login still
+        resyncs its rotated credential into the backup."""
+        from claude_swap.session import write_own_login_marker
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        d = s._session_dir("1", "test@example.com")
+        d.mkdir(parents=True)
+        write_own_login_marker(d, "own", "test@example.com", "")
+        live = _oauth_creds("sk-live-rotated", 7200)
+        stale = _oauth_creds("sk-backup-old", -3600)
+
+        with patch.object(s, "_read_credentials", return_value=live), \
+             patch.object(s, "_read_account_credentials", return_value=stale), \
+             patch.object(s, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.fetch_oauth_profile", return_value={
+                 "uuid": "uuid-1", "email": "test@example.com",
+                 "organizationUuid": None,
+             }), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            s._fetch_active_usage("1", "test@example.com", live)
+
+        write_backup.assert_called_once_with("1", "test@example.com", live)
