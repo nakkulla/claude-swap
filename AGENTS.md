@@ -10,6 +10,8 @@ upstream이 정본이다.
   `main`에 merge하는 커밋 하나로 한다. rebase나 force-push로 이력을 다시 쓰지 않는다.
 - fork 고유 변경은 작게, 기존 모듈 안에서 끝낸다. upstream 파일의 대규모 재배치·
   포맷 변경은 merge 충돌만 늘리므로 하지 않는다.
+- upstream merge에서 세션 프로필·백업 동기화 경로가 바뀌면 독립 로그인 표식 프로필을
+  건너뛰는 분기를 유지한다 (ADR 0001).
 - fork 전용 파일은 `AGENTS.md`, `CLAUDE.md`, `docs/`, `repo-ops/`,
   `tests/test_repo_ops_deploy.py`로 한정한다. upstream에 PR을 보낼 때는 이 파일들을 뺀
   별도 브랜치를 쓴다.
