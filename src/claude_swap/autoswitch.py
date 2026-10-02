@@ -779,13 +779,17 @@ class AutoSwitchEngine:
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
-        if self.switcher.live_session_pids_for(number, email):
+        if self.switcher.live_session_pids_for(
+            number, email
+        ) and self.switcher.session_login_state(number, email) is None:
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put
             # one rotating refresh token in two config dirs (the stale-copy
             # failure class) with nobody reading the warning — and its quota
             # is already being consumed by that session anyway. Manual
             # switch_to keeps its warn-and-proceed behavior; auto skips.
+            # A profile with its own login holds a separate family, so there
+            # is no second copy and nothing to skip.
             return "skip-live-session"
         creds = self.switcher.read_account_credentials(number, email)
         if not creds:

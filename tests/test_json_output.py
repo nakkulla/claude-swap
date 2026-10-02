@@ -754,6 +754,82 @@ class TestAccountRowDisabled:
         assert "disabled" not in row
 
 
+class TestSessionLoginField:
+    """§5 item 12: the additive ``sessionLogin`` field on --list rows."""
+
+    @pytest.mark.parametrize("state", ["own", "pending"])
+    def test_present_with_a_marker(self, state):
+        row = account_row(2, "b@example.com", "", "", False, None, session_login=state)
+        assert row["sessionLogin"] == state
+
+    def test_absent_without_a_marker(self):
+        row = account_row(1, "a@example.com", "", "", False, None)
+        assert "sessionLogin" not in row
+
+    def test_list_payload_reports_each_profiles_marker(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+    ):
+        from claude_swap.session import write_own_login_marker
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["3"] = {
+            "email": "account3@example.com", "uuid": "uuid-3",
+            "added": "2024-01-03T00:00:00Z",
+        }
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        for num, email, state in (
+            ("1", "test@example.com", "own"),
+            ("2", "account2@example.com", "pending"),
+        ):
+            profile = switcher._session_dir(num, email)
+            profile.mkdir(parents=True)
+            write_own_login_marker(profile, state, email, "")
+        # Account 3 has a profile but no marker: no field.
+        switcher._session_dir("3", "account3@example.com").mkdir(parents=True)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials("", False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None)):
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert by_num[1]["sessionLogin"] == "own"
+        assert by_num[2]["sessionLogin"] == "pending"
+        assert "sessionLogin" not in by_num[3]
+
+    def test_human_list_shows_the_marker(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys,
+    ):
+        from claude_swap.session import write_own_login_marker
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        profile = switcher._session_dir("2", "account2@example.com")
+        profile.mkdir(parents=True)
+        write_own_login_marker(profile, "own", "account2@example.com", "")
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials("", False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch("claude_swap.switcher.get_running_instances",
+                   return_value=([], [])):
+            switcher.list_accounts()
+
+        lines = capsys.readouterr().out.splitlines()
+        line2 = next(line for line in lines if "account2@example.com" in line)
+        line1 = next(line for line in lines if "test@example.com" in line)
+        assert "session login: own" in line2
+        assert "session login" not in line1
+
+
 class TestUsageFromJson:
     """``list --json`` usage read back into the internal dict (import-usage)."""
 

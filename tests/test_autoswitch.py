@@ -1851,6 +1851,30 @@ class TestFreshening:
         mock_refresh.assert_not_called()
         assert h.active_number() == 1
 
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_live_session_with_its_own_login_is_not_skipped(
+        self, temp_home, state
+    ):
+        """A session profile with its own login holds a separate token family,
+        so activating the account as the default login makes no second copy:
+        the live session is no reason to skip it."""
+        from claude_swap.session import write_own_login_marker
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        profile = h.switcher._session_dir("2", "b@example.com")
+        profile.mkdir(parents=True)
+        write_own_login_marker(profile, state, "b@example.com", "")
+        with patch.object(
+            h.switcher, "live_session_pids_for", return_value=[4242]
+        ):
+            assert h.engine._freshen_target("2", "b@example.com") == "ok"
+            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     def test_live_session_near_expiry_is_skipped(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

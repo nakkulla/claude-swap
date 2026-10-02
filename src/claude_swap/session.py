@@ -183,6 +183,58 @@ def mark_session_stale(session_dir: Path) -> bool:
     except OSError:
         return False
 
+
+# Own-login marker: this profile holds a token family of its own, from a
+# separate `claude auth login` inside it (`cswap session login`). cswap never
+# copies that family into the backup/default login, and never seeds the
+# profile from the backup while the marker exists. A CHILD of the profile dir,
+# so it moves and dies with the profile (`_delete_session_profile`'s rmtree).
+OWN_LOGIN_MARKER = ".cswap-own-login.json"
+OWN_LOGIN_STATES = ("pending", "own")
+
+
+def own_login_state(session_dir: Path) -> str | None:
+    """``"own"``, ``"pending"``, or ``None`` when the profile has no marker.
+
+    The one predicate every lineage path asks. A marker that exists but
+    cannot be read or parsed answers ``"pending"``: it can only have come from
+    `cswap session login`, so the profile may hold a family the backup does
+    not own, and "pending" keeps it both untouched and refused by `run` until
+    a login or logout settles it. Never raises.
+    """
+    try:
+        text = (session_dir / OWN_LOGIN_MARKER).read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except (OSError, ValueError):
+        return "pending"
+    try:
+        state = json.loads(text).get("state")
+    except (ValueError, AttributeError):
+        return "pending"
+    return state if state in OWN_LOGIN_STATES else "pending"
+
+
+def write_own_login_marker(
+    session_dir: Path, state: str, email: str, org_uuid: str
+) -> None:
+    """Atomically record the profile's own-login state."""
+    if state not in OWN_LOGIN_STATES:
+        raise ValueError(f"unknown own-login state: {state!r}")
+    atomic_write_json(
+        session_dir / OWN_LOGIN_MARKER,
+        {
+            "state": state,
+            "email": email,
+            "organizationUuid": org_uuid or "",
+            "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
+
+
+def clear_own_login_marker(session_dir: Path) -> None:
+    (session_dir / OWN_LOGIN_MARKER).unlink(missing_ok=True)
+
 # Env vars that make claude bypass account OAuth entirely (verified against
 # claude 2.1.175). Dropped from the auth-status probe (they'd fake "logged in"
 # for the wrong reason) AND scrubbed from the session launch env with a
@@ -199,6 +251,10 @@ AUTH_OVERRIDE_ENV_VARS = (
 
 # `claude auth status` is a local check (no API call) but spawns the full CLI.
 _AUTH_STATUS_TIMEOUT = 10.0
+
+# `claude auth logout` may talk to the server, so it gets more room than the
+# local status probe.
+_AUTH_LOGOUT_TIMEOUT = 30.0
 
 # Bootstrap holds the backup-dir lock across one token refresh (10s network
 # timeout) plus auth-status probes, so it needs more headroom than the
@@ -520,10 +576,34 @@ def _mkdir_private(path: Path) -> None:
 
 
 def _probe_env(session_dir: Path) -> dict[str, str]:
-    """Env for the auth-status probe: session config dir, auth overrides dropped."""
+    """Env for the auth-status probe: session config dir, auth overrides dropped.
+
+    Also the launch env of `cswap run` and the env of `cswap session
+    login/logout`. For an own-login profile ``CLAUDE_SECURESTORAGE_CONFIG_DIR``
+    is dropped too, whatever its value: defined at all (empty included) it
+    points claude at another secure store than the profile's own, which is
+    the one place that profile's token family lives.
+    """
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
+    if own_login_state(session_dir) is not None:
+        env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
     return env
+
+
+def _pending_login_message(account_num: str, email: str) -> str:
+    return (
+        f"Account-{account_num} ({email})'s session login has not finished — "
+        f"run `cswap session login {account_num}` or "
+        f"`cswap session logout {account_num}`."
+    )
+
+
+def _invalid_login_message(account_num: str, email: str) -> str:
+    return (
+        f"Account-{account_num} ({email})'s session login is not valid — "
+        f"run `cswap session login {account_num}`."
+    )
 
 
 class SessionManager:
@@ -568,6 +648,11 @@ class SessionManager:
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
+        own_state = own_login_state(
+            session_dir_for(self.switcher.backup_dir, account_num, email)
+        )
+        if own_state == "pending":
+            raise SessionError(_pending_login_message(account_num, email))
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         if config_dir_preset:
@@ -578,11 +663,13 @@ class SessionManager:
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
-        else:
+        elif own_state is None:
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
             # two copies of one account can drift if the server rotates the
-            # refresh token.
+            # refresh token. An own-login profile is not a copy, so it always
+            # launches in the profile: a session on the default login would
+            # change account under it at the next switch.
             current = self.switcher._get_current_account()
             if current is not None and current == (email, org_uuid):
                 if require_session:
@@ -617,11 +704,7 @@ class SessionManager:
             f"{accent('Launching')} Account-{account_num} ({email}) "
             f"{muted('[session mode]')}"
         )
-        env = {
-            k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
-        }
-        env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env)
+        self._exec(claude_bin, claude_args, env=_probe_env(session_dir))
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
@@ -681,6 +764,13 @@ class SessionManager:
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+
+        own_state = own_login_state(session_dir)
+        if own_state is not None:
+            return self._setup_own_login_session(
+                session_dir, account_num, email, org_uuid, own_state,
+                share, share_history,
+            )
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -834,6 +924,270 @@ class SessionManager:
 
         return session_dir, account_num, email
 
+    def _setup_own_login_session(
+        self,
+        session_dir: Path,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        own_state: str,
+        share: bool,
+        share_history: bool,
+    ) -> tuple[Path, str, str]:
+        """``setup_session`` for a profile with its own login: verify, never seed.
+
+        No backup refresh, no stale or fingerprint re-seed, no cleanup on a
+        failed check: the profile's family is not the backup's, so re-seeding
+        it from the backup would put the copied family back in two places —
+        the conflict the own login exists to remove. Every failure leaves the
+        profile, its keychain item and its marker as they are.
+        """
+        if own_state != "own":
+            raise SessionError(_pending_login_message(account_num, email))
+        verdict = self._session_validity(session_dir, email, org_uuid)
+        if verdict == "unknown" and _artifacts_say_usable(
+            session_dir, email, org_uuid
+        ):
+            verdict = "valid"
+        if verdict == "unreachable":
+            raise SessionError(
+                f"Session profile for Account-{account_num} ({email}) could "
+                f"not be verified: `claude auth status` did not run. The "
+                f"profile is left in place — check that `claude` is on PATH, "
+                f"then retry."
+            )
+        if verdict != "valid":
+            raise SessionError(_invalid_login_message(account_num, email))
+        self._sync_sharing(session_dir, share, share_history)
+        return session_dir, account_num, email
+
+    # -- own login ---------------------------------------------------------
+
+    def login(self, identifier: str) -> tuple[str, str]:
+        """`cswap session login`: give the profile a login of its own.
+
+        Returns ``(account_num, email)`` once the marker reads ``own``. Every
+        failure after the ``pending`` marker is written raises with the marker
+        left ``pending``, which keeps the profile out of every sync path and
+        refused by `run` until a retry or `cswap session logout` settles it.
+        """
+        from claude_swap import oauth as _oauth
+
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            raise SessionError(
+                "'claude' was not found on PATH. Install Claude Code first."
+            )
+        account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        if self.switcher._account_kind(account_num) == "api_key":
+            raise SessionError(
+                f"Account-{account_num} ({email}) is an API-key account; "
+                "`cswap session login` needs a claude.ai login."
+            )
+        stored = self.switcher.read_account_credentials(account_num, email)
+        if stored and not self._has_refresh_token(stored):
+            raise SessionError(
+                f"Account-{account_num} ({email}) is a setup-token account; "
+                "`cswap session login` needs a claude.ai login."
+            )
+        oauth_account, theme = self._stored_identity(account_num, email)
+        session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+
+        # One lock section: the live check, the absorb and the `pending` write
+        # must not interleave with a bootstrap, a switch or the consume gate.
+        # The lock is non-reentrant, so the absorb is the store's pure write,
+        # not `_adopt_session_credential` (which takes this lock itself).
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            self.switcher._ensure_no_live_session(
+                account_num, email, "`cswap session login`"
+            )
+            if own_login_state(session_dir) is None:
+                # A copied profile that rotated past the backup holds the only
+                # live generation of the backup's family; the login below
+                # replaces it, and the backup would be left on a spent grant.
+                ahead = self.switcher._session_profile_ahead(
+                    account_num, email, org_uuid
+                )
+                if ahead is not None:
+                    self.switcher._store._write_account_credentials(
+                        account_num, email, ahead
+                    )
+            session_dir.mkdir(parents=True, exist_ok=True)
+            if sys.platform != "win32":
+                os.chmod(session_dir, 0o700)
+            write_own_login_marker(session_dir, "pending", email, org_uuid)
+
+        self._write_identity_seed(session_dir, oauth_account, theme)
+        before_fp = _oauth.credential_fingerprint(
+            read_session_credentials(session_dir) or ""
+        )
+
+        print(
+            f"{accent('Logging in')} Account-{account_num} ({email}) "
+            f"{muted('[session profile]')}"
+        )
+        try:
+            returncode = subprocess.run(
+                [claude_bin, "auth", "login", "--claudeai", "--email", email],
+                env=_probe_env(session_dir),
+            ).returncode
+        except KeyboardInterrupt:
+            returncode = None
+        except OSError as e:
+            raise SessionError(
+                f"Could not run `claude auth login`: {e}. "
+                + _pending_login_message(account_num, email)
+            )
+        if returncode != 0:
+            raise SessionError(
+                "`claude auth login` did not complete. "
+                + _pending_login_message(account_num, email)
+            )
+
+        verdict = self._session_validity(session_dir, email, org_uuid)
+        if verdict != "valid":
+            if session_identity_drifted(session_dir, email, org_uuid):
+                self._claude_auth_logout(claude_bin, session_dir)
+                raise SessionError(
+                    f"The login inside Account-{account_num}'s session profile "
+                    f"is a different account than {email}; it was logged out "
+                    f"again. " + _pending_login_message(account_num, email)
+                )
+            raise SessionError(
+                f"The session login for Account-{account_num} ({email}) could "
+                f"not be verified (`claude auth status`: {verdict}). "
+                + _pending_login_message(account_num, email)
+            )
+        # A status that reads valid but still shows the family the profile
+        # held before, or the backup's, means no new login landed (a cancelled
+        # login over a copied profile): calling that `own` would bring the
+        # shared family back without anything syncing it.
+        after_fp = _oauth.credential_fingerprint(
+            read_session_credentials(session_dir) or ""
+        )
+        backup_fp = _oauth.credential_fingerprint(
+            self.switcher.read_account_credentials(account_num, email)
+        )
+        if after_fp is None or after_fp in (before_fp, backup_fp):
+            raise SessionError(
+                f"No new login was found in Account-{account_num}'s session "
+                f"profile. " + _pending_login_message(account_num, email)
+            )
+
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            self.switcher._ensure_no_live_session(
+                account_num, email, "`cswap session login`"
+            )
+            write_own_login_marker(session_dir, "own", email, org_uuid)
+        self._logger.info(f"Account {account_num}'s session profile has its own login")
+        return account_num, email
+
+    def logout(self, identifier: str) -> tuple[str, str]:
+        """`cswap session logout`: drop the profile's own login.
+
+        The next `cswap run` seeds the profile from the backup again. Returns
+        ``(account_num, email)``.
+        """
+        from claude_swap import oauth as _oauth
+
+        account_num, email, _org_uuid = self.switcher.resolve_account(identifier)
+        session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        if own_login_state(session_dir) is None:
+            raise SessionError(
+                f"Account-{account_num} ({email}) has no session login of its "
+                f"own; nothing to log out."
+            )
+        self.switcher._ensure_no_live_session(
+            account_num, email, "`cswap session logout`"
+        )
+        profile = read_session_credentials(session_dir)
+        backup = self.switcher.read_account_credentials(account_num, email)
+        # A pending profile can still hold the backup's copied family (a login
+        # that never landed); that family is not the profile's to log out.
+        if profile and _oauth.credential_fingerprint(
+            profile
+        ) != _oauth.credential_fingerprint(backup):
+            claude_bin = shutil.which("claude")
+            if claude_bin:
+                self._claude_auth_logout(claude_bin, session_dir)
+            else:
+                warning(
+                    "'claude' was not found on PATH; removing the session "
+                    "login's local credentials only."
+                )
+
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            self.switcher._ensure_no_live_session(
+                account_num, email, "`cswap session logout`"
+            )
+            delete_macos_keychain_entry(session_dir)
+            (session_dir / ".credentials.json").unlink(missing_ok=True)
+            if _may_have_credential_material(session_dir):
+                raise SessionError(
+                    f"Could not remove Account-{account_num}'s session login "
+                    f"credentials (keychain unreadable?); the session login "
+                    f"is kept. Retry `cswap session logout {account_num}`."
+                )
+            clear_own_login_marker(session_dir)
+        self._logger.info(f"Logged out account {account_num}'s session login")
+        return account_num, email
+
+    def _claude_auth_logout(self, claude_bin: str, session_dir: Path) -> None:
+        """Best-effort `claude auth logout` inside the profile."""
+        try:
+            result = subprocess.run(
+                [claude_bin, "auth", "logout"],
+                env=_probe_env(session_dir),
+                capture_output=True,
+                text=True,
+                timeout=_AUTH_LOGOUT_TIMEOUT,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            warning(f"`claude auth logout` did not run cleanly ({e}).")
+            return
+        if result.returncode != 0:
+            warning(
+                f"`claude auth logout` exited with status {result.returncode}."
+            )
+
+    def _stored_identity(self, account_num: str, email: str) -> tuple[dict, str]:
+        """The slot's stored ``oauthAccount`` and theme, for the profile seed."""
+        config_text = self.switcher.read_account_config(account_num, email)
+        try:
+            config_data = json.loads(config_text) if config_text else {}
+        except json.JSONDecodeError:
+            config_data = {}
+        oauth_account = config_data.get("oauthAccount")
+        if not oauth_account:
+            raise SessionError(
+                f"Account-{account_num} has no stored config backup. "
+                f"Re-add with: cswap --add-account --slot {account_num}"
+            )
+        return oauth_account, config_data.get("theme") or "dark"
+
+    def _write_identity_seed(
+        self, session_dir: Path, oauth_account: dict, theme: str
+    ) -> None:
+        """Merge the identity seed into the profile's ``.claude.json``.
+
+        Merged into any existing file so a re-seed preserves the profile's own
+        projects/history. The `theme` key is load-bearing: claude shows
+        onboarding when `!config.theme || !config.hasCompletedOnboarding`.
+        """
+        config_path = session_dir / ".claude.json"
+        existing: dict = {}
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text(encoding="utf-8")) or {}
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        existing["oauthAccount"] = oauth_account
+        existing["hasCompletedOnboarding"] = True
+        existing.setdefault("theme", theme)
+        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(config_path, 0o600)
+
     def _profile_matches_backup(
         self, session_dir: Path, account_num: str, email: str
     ) -> bool:
@@ -887,17 +1241,7 @@ class SessionManager:
         # non-reentrant) may have already rotated the backup; the read
         # above picked that successor up. No POST happens here.
 
-        config_text = self.switcher.read_account_config(account_num, email)
-        try:
-            config_data = json.loads(config_text) if config_text else {}
-        except json.JSONDecodeError:
-            config_data = {}
-        oauth_account = config_data.get("oauthAccount")
-        if not oauth_account:
-            raise SessionError(
-                f"Account-{account_num} has no stored config backup. "
-                f"Re-add with: cswap --add-account --slot {account_num}"
-            )
+        oauth_account, theme = self._stored_identity(account_num, email)
 
         session_dir.mkdir(parents=True, exist_ok=True)
         if sys.platform != "win32":
@@ -908,23 +1252,7 @@ class SessionManager:
         if sys.platform != "win32":
             os.chmod(creds_path, 0o600)
 
-        # Merge the identity seed into any existing .claude.json so a
-        # re-bootstrap preserves the profile's own projects/history. The
-        # `theme` key is load-bearing: claude shows onboarding when
-        # `!config.theme || !config.hasCompletedOnboarding`.
-        config_path = session_dir / ".claude.json"
-        existing: dict = {}
-        if config_path.exists():
-            try:
-                existing = json.loads(config_path.read_text(encoding="utf-8")) or {}
-            except (json.JSONDecodeError, OSError):
-                existing = {}
-        existing["oauthAccount"] = oauth_account
-        existing["hasCompletedOnboarding"] = True
-        existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
+        self._write_identity_seed(session_dir, oauth_account, theme)
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"

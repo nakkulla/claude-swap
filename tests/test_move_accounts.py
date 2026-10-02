@@ -576,3 +576,77 @@ class TestMoveUnreadableSourceIsNotAbsent:
         assert (num_src, num_target, swapped) == ("2", "5", False)
         data = switcher._get_sequence_data()
         assert data["accounts"]["5"]["email"] == "account2@example.com"
+
+
+class TestMoveRefusesOwnLoginProfiles:
+    """§5 item 11: a profile with its own login cannot follow its account to
+    another slot number (its keychain item is named by the profile path), so
+    the move is refused before anything changes."""
+
+    EMAIL = "account2@example.com"
+
+    def _setup(self, sample_sequence_data, block_real_keychain, state):
+        from claude_swap.session import (
+            _keychain_account_name,
+            keychain_service_name,
+            write_own_login_marker,
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        switcher._write_account_credentials("2", self.EMAIL, "backup-rt")
+        switcher._write_account_credentials("1", "account1@example.com", "rt-1")
+        profile = switcher._session_dir("2", self.EMAIL)
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text("own-family")
+        write_own_login_marker(profile, state, self.EMAIL, "")
+        item = (keychain_service_name(profile), _keychain_account_name())
+        block_real_keychain.set_password(*item, "own-family")
+        return switcher, profile, item
+
+    @pytest.mark.parametrize("target", ["5", "1"], ids=["empty", "occupied"])
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_marked_account_is_refused_before_anything_changes(
+        self, temp_home: Path, sample_sequence_data: dict, block_real_keychain,
+        state, target,
+    ):
+        from claude_swap.exceptions import SessionError
+        from claude_swap.session import own_login_state
+
+        switcher, profile, item = self._setup(
+            sample_sequence_data, block_real_keychain, state
+        )
+        # The one-time org-field migration runs first either way; what
+        # must not change is everything after it.
+        switcher._get_sequence_data_migrated()
+        before = switcher._get_sequence_data()
+
+        with pytest.raises(SessionError, match="cswap session logout 2"):
+            switcher.move_account("2", target)
+
+        assert switcher._get_sequence_data()["accounts"] == before["accounts"]
+        assert own_login_state(profile) == state
+        assert (profile / ".credentials.json").read_text() == "own-family"
+        assert block_real_keychain.get_password(*item) == "own-family"
+        assert switcher._read_account_credentials("2", self.EMAIL) == "backup-rt"
+        assert (
+            switcher._read_account_credentials("1", "account1@example.com")
+            == "rt-1"
+        )
+        assert not switcher._session_dir(target, self.EMAIL).exists()
+
+    def test_moving_the_other_account_onto_a_marked_slot_is_refused(
+        self, temp_home: Path, sample_sequence_data: dict, block_real_keychain
+    ):
+        from claude_swap.exceptions import SessionError
+
+        switcher, profile, _ = self._setup(
+            sample_sequence_data, block_real_keychain, "own"
+        )
+
+        with pytest.raises(SessionError, match="cswap session logout 2"):
+            switcher.move_account("1", "2")
+
+        assert profile.is_dir()
+        assert switcher._get_sequence_data()["accounts"]["2"]["email"] == self.EMAIL

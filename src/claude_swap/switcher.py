@@ -793,7 +793,12 @@ class ClaudeAccountSwitcher:
         manages it; pulling credentials out from under a running process would be
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
+
+        A profile with its own login is left alone: the backup's family is not
+        the one it holds.
         """
+        if self.session_login_state(account_num, email) is not None:
+            return
         if self._live_session_pids(account_num, email):
             from claude_swap.session import mark_session_stale
 
@@ -1131,6 +1136,8 @@ class ClaudeAccountSwitcher:
         email_a = record_a.get("email", "")
         email_b = record_b.get("email", "")
 
+        self._ensure_no_own_login(num_a, email_a, "--swap-accounts")
+        self._ensure_no_own_login(num_b, email_b, "--swap-accounts")
         # Backups and session profiles are keyed by (slot, email); relocating
         # them under a live session-mode claude would pull state out from
         # under a running process.
@@ -1552,6 +1559,7 @@ class ClaudeAccountSwitcher:
             )
         email = record.get("email", "")
 
+        self._ensure_no_own_login(num_src, email, "--move-account")
         # Relocating backups/session under a live session-mode claude would
         # pull state out from under a running process.
         self._ensure_no_live_session(num_src, email, "--move-account")
@@ -1948,6 +1956,13 @@ class ClaudeAccountSwitcher:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
         return self._live_session_pids(account_num, email)
 
+    def session_login_state(self, account_num: str, email: str) -> str | None:
+        """``"own"``/``"pending"`` when the slot's session profile has its own
+        login (``cswap session login``), else ``None``."""
+        from claude_swap.session import own_login_state
+
+        return own_login_state(self._session_dir(account_num, email))
+
     def persist_backup_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
@@ -2100,6 +2115,7 @@ class ClaudeAccountSwitcher:
         """Body of ``consume_backup_grant``; caller holds the consume lock."""
         from claude_swap.session import (
             is_session_stale,
+            own_login_state,
             read_session_credentials,
             session_dir_for,
             session_identity_drifted,
@@ -2192,6 +2208,8 @@ class ClaudeAccountSwitcher:
                         # deliberate re-add/import): never let it supersede
                         # the backup it is presumed stale against.
                         and not is_session_stale(sdir)
+                        # An own-login profile's family is not the backup's.
+                        and own_login_state(sdir) is None
                         and not session_identity_drifted(sdir, email, org_uuid)
                     ):
                         prof_oauth = oauth.extract_oauth_data(profile)
@@ -2753,6 +2771,20 @@ class ClaudeAccountSwitcher:
                 f"retry {action}."
             )
 
+    def _ensure_no_own_login(self, account_num: str, email: str, action: str) -> None:
+        """Refuse to renumber a slot whose session profile has its own login.
+
+        The profile's keychain item is named by a hash of the profile path,
+        so moving the directory would strand that login; nothing is changed.
+        """
+        if self.session_login_state(account_num, email) is not None:
+            raise SessionError(
+                f"Account-{account_num} ({email}) has its own session login, "
+                f"which cannot move to another slot number. Run "
+                f"`cswap session logout {account_num}` first, then retry "
+                f"{action}."
+            )
+
     def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
         """Drop a session profile's credential material, keeping its history.
 
@@ -2764,10 +2796,11 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import (
             clear_session_stale,
             delete_macos_keychain_entry,
+            own_login_state,
         )
 
         session_dir = self._session_dir(account_num, email)
-        if not session_dir.exists():
+        if not session_dir.exists() or own_login_state(session_dir) is not None:
             return
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
@@ -2796,16 +2829,18 @@ class ClaudeAccountSwitcher:
         newer generation of this one); a profile flagged stale (the backup
         moved under it while it was live, and cswap has already decided it
         re-bootstraps); and anything unreadable, because a read error is not
-        evidence of drift.
+        evidence of drift. A profile with its own login answers None too: its
+        family is a separate one, never a generation of the backup's.
         """
         from claude_swap.session import (
             is_session_stale,
+            own_login_state,
             read_session_credentials,
             session_identity_drifted,
         )
 
         session_dir = self._session_dir(account_num, email)
-        if is_session_stale(session_dir):
+        if is_session_stale(session_dir) or own_login_state(session_dir) is not None:
             return None
         profile = read_session_credentials(session_dir)
         if not profile or session_identity_drifted(session_dir, email, org_uuid):
@@ -2849,9 +2884,11 @@ class ClaudeAccountSwitcher:
         captured, and the two now hold the same generation. Returns whether
         the backup was advanced.
         """
-        from claude_swap.session import profile_is_quiescent
+        from claude_swap.session import own_login_state, profile_is_quiescent
 
         session_dir = self._session_dir(account_num, email)
+        if own_login_state(session_dir) is not None:
+            return False
         with FileLock(self.lock_file):
             if not profile_is_quiescent(session_dir):
                 return False
@@ -4069,6 +4106,13 @@ class ClaudeAccountSwitcher:
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
 
+    def _active_store_is_own_login(self) -> bool:
+        """Whether ``CLAUDE_CONFIG_DIR`` names a profile with its own login."""
+        from claude_swap.session import own_login_state
+
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        return bool(config_dir) and own_login_state(Path(config_dir)) is not None
+
     def _fetch_active_usage(
         self, account_num: str, email: str, creds: str, org_uuid: str = ""
     ) -> FetchRecord:
@@ -4112,6 +4156,14 @@ class ClaudeAccountSwitcher:
         oauth_data = oauth.extract_oauth_data(creds)
         if not oauth_data or not oauth_data.get("accessToken"):
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
+
+        if self._active_store_is_own_login():
+            # CLAUDE_CONFIG_DIR names a session profile with its own login, so
+            # the "active" credential is that profile's family, not the
+            # slot backup's: read it, never resync, refresh or persist it.
+            if oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+            return self._read_only_fetch(account_num, email, creds, None)
 
         # Every defer before the grant is consumed routes through this: a
         # genuinely expired token earns the sentinel, but a locally-valid
@@ -4821,6 +4873,7 @@ class ClaudeAccountSwitcher:
             return self._fetch_active_usage(str(num), email, creds, org_uuid)
 
         from claude_swap.session import (
+            own_login_state,
             read_session_credentials,
             session_identity_drifted,
         )
@@ -4837,7 +4890,14 @@ class ClaudeAccountSwitcher:
         # no persist): rotating the profile's family here would log the live
         # claude out the same way.
         session_dir = self._session_dir(str(num), email)
-        session_creds = read_session_credentials(session_dir)
+        if own_login_state(session_dir) is not None:
+            # The profile has its own login: its family is not the backup's,
+            # so the backup is this slot's credential to read and refresh, live
+            # session or not, and nothing is adopted from the profile.
+            session_creds = None
+            has_live_session = False
+        else:
+            session_creds = read_session_credentials(session_dir)
         if session_creds and session_identity_drifted(session_dir, email, org_uuid):
             # An in-session /login re-pointed the profile at a different
             # account; fetching with its credential would record THAT
@@ -5500,6 +5560,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
+                    session_login=self.session_login_state(str(num), email),
                 )
             )
         payload = {
@@ -5564,6 +5625,9 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            session_login = self.session_login_state(str(num), email)
+            if session_login:
+                markers += f" {muted(f'(session login: {session_login})')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
@@ -6724,11 +6788,13 @@ class ClaudeAccountSwitcher:
         # backup, the backup is a consumed generation and activating it is
         # certain to fail: refuse. With nothing running against the profile
         # the fix is simpler still — adopt its credential into the backup
-        # first, and the switch activates the live generation.
+        # first, and the switch activates the live generation. None of it
+        # applies to a profile with its own login: the backup's family and
+        # the profile's are separate, so there is no second copy to warn of.
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
-        if pre_email:
+        if pre_email and self.session_login_state(target_account, pre_email) is None:
             pre_org = pre_account.get("organizationUuid", "") or ""
             sessions, unreadable = scan_live_sessions(
                 self._session_dir(target_account, pre_email)

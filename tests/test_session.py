@@ -2861,3 +2861,747 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
         )
+
+
+# ---------------------------------------------------------------------------
+# own login (cswap session login/logout) — the lineage boundary
+# ---------------------------------------------------------------------------
+
+# A login of the profile's own: a different family from the backup's CREDS.
+OWN_CREDS = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": "own-access",
+            "refreshToken": "own-refresh",
+            "expiresAt": 9999999999999,
+        }
+    }
+)
+OTHER_EMAIL = "someone-else@example.com"
+OTHER_CREDS = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": "other-access",
+            "refreshToken": "other-refresh",
+            "expiresAt": 9999999999999,
+        }
+    }
+)
+
+
+def _profile(switcher) -> Path:
+    return session_dir_for(switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+
+def _seed_marked_profile(
+    switcher, state: str | None, creds: str = OWN_CREDS
+) -> Path:
+    """A profile holding ``creds``, the slot's identity and (unless ``state``
+    is None) an own-login marker."""
+    session_dir = _profile(switcher)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / ".credentials.json").write_text(creds)
+    (session_dir / ".claude.json").write_text(CONFIG)
+    if state is not None:
+        session_mod.write_own_login_marker(
+            session_dir, state, ACCOUNT_EMAIL, ORG_UUID
+        )
+    return session_dir
+
+
+def _identity(email: str, org: str) -> str:
+    return json.dumps({"oauthAccount": {
+        "emailAddress": email, "organizationUuid": org,
+    }})
+
+
+class FakeClaude:
+    """`claude auth login/logout/status` inside a profile, on disk only.
+
+    ``login`` decides what an interactive `claude auth login` leaves behind:
+    ``success`` (the slot's account, new family), ``cancel`` (nothing, rc 1),
+    ``partial`` (a new family written, then rc 1), ``other_account`` (another
+    account's login, rc 0), ``noop`` (rc 0, nothing changed) or ``interrupt``
+    (Ctrl+C). Status reads the profile's files the way the probe would.
+    """
+
+    def __init__(self, login: str = "success", status_valid: bool | None = None):
+        self.login = login
+        self.status_valid = status_valid
+        self.calls: list[tuple[tuple[str, ...], dict]] = []
+
+    def args(self) -> list[tuple[str, ...]]:
+        return [args for args, _ in self.calls]
+
+    def __call__(self, cmd, env=None, **kwargs):
+        args = tuple(cmd[1:])
+        self.calls.append((args, dict(env or {})))
+        profile = Path(env["CLAUDE_CONFIG_DIR"])
+        if args[:2] == ("auth", "login"):
+            if self.login == "interrupt":
+                raise KeyboardInterrupt
+            if self.login in ("success", "partial"):
+                (profile / ".credentials.json").write_text(OWN_CREDS)
+                (profile / ".claude.json").write_text(
+                    _identity(ACCOUNT_EMAIL, ORG_UUID)
+                )
+            elif self.login == "other_account":
+                (profile / ".credentials.json").write_text(OTHER_CREDS)
+                (profile / ".claude.json").write_text(_identity(OTHER_EMAIL, ""))
+            rc = 0 if self.login in ("success", "other_account", "noop") else 1
+            return SimpleNamespace(returncode=rc, stdout="", stderr="")
+        if args[:2] == ("auth", "logout"):
+            (profile / ".credentials.json").unlink(missing_ok=True)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        assert args[:2] == ("auth", "status"), args
+        logged_in = (profile / ".credentials.json").exists()
+        if self.status_valid is not None:
+            logged_in = self.status_valid
+        identity = read_session_identity(profile) or ("", "")
+        payload = (
+            {"loggedIn": True, "authMethod": "claude.ai",
+             "email": identity[0], "orgId": identity[1]}
+            if logged_in
+            else {"loggedIn": False, "authMethod": "none"}
+        )
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+
+@pytest.fixture
+def fake_claude(monkeypatch):
+    fake = FakeClaude()
+    monkeypatch.setattr(session_mod.subprocess, "run", fake)
+    monkeypatch.setattr(session_mod.shutil, "which", lambda name: f"/fake/bin/{name}")
+    return fake
+
+
+@pytest.fixture
+def no_gate(monkeypatch):
+    """Records consume-gate calls; a marked profile must never reach it."""
+    calls: list[str] = []
+
+    def gate(self, num, email, snap):
+        calls.append(snap)
+        return oauth.RefreshOutcome(None, "transient")
+
+    monkeypatch.setattr(ClaudeAccountSwitcher, "consume_backup_grant", gate)
+    return calls
+
+
+class TestOwnLoginMarker:
+    def test_absent_marker_is_none(self, tmp_path):
+        assert session_mod.own_login_state(tmp_path) is None
+        assert session_mod.own_login_state(tmp_path / "missing") is None
+
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_written_state_reads_back(self, tmp_path, state):
+        session_mod.write_own_login_marker(tmp_path, state, "a@x.com", "org")
+        assert session_mod.own_login_state(tmp_path) == state
+        data = json.loads((tmp_path / session_mod.OWN_LOGIN_MARKER).read_text())
+        assert data["state"] == state
+        assert data["email"] == "a@x.com"
+        assert data["organizationUuid"] == "org"
+        assert data["updatedAt"]
+
+    @pytest.mark.parametrize(
+        "content", ["not json{{", "[]", '{"state": "weird"}', "\udcff"]
+    )
+    def test_garbled_marker_fails_closed_as_pending(self, tmp_path, content):
+        """A marker only `session login` writes: unreadable is still marked,
+        and pending keeps it both untouched and refused by `run`."""
+        path = tmp_path / session_mod.OWN_LOGIN_MARKER
+        if content == "\udcff":
+            path.write_bytes(b"\xff\xfe")
+        else:
+            path.write_text(content)
+        assert session_mod.own_login_state(tmp_path) == "pending"
+
+    def test_unknown_state_is_rejected_on_write(self, tmp_path):
+        with pytest.raises(ValueError):
+            session_mod.write_own_login_marker(tmp_path, "done", "a@x.com", "")
+
+
+class TestOwnLoginSetupSession:
+    """§5 items 1 and 2: setup_session never seeds, refreshes or deletes a
+    marked profile, and fails closed instead."""
+
+    def test_own_profile_skips_pre_refresh_and_every_reseed(
+        self, manager, seeded_switcher, fake_claude, no_gate
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+        # Every copy-mode re-seed trigger at once: a stale marker and a
+        # fingerprint that differs from the backup's.
+        _mark_stale(session_dir)
+
+        got, num, email = manager.setup_session("2", share=False)
+
+        assert (got, num, email) == (session_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        assert no_gate == []  # no backup-grant pre-refresh
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+        assert session_mod.own_login_state(session_dir) == "own"
+
+    def test_pending_profile_is_refused_untouched(
+        self, manager, seeded_switcher, fake_claude, no_gate
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "pending")
+
+        with pytest.raises(SessionError, match="has not finished"):
+            manager.setup_session("2", share=False)
+
+        assert no_gate == []
+        assert fake_claude.calls == []
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+        assert session_mod.own_login_state(session_dir) == "pending"
+
+    def test_invalid_own_login_keeps_profile_keychain_and_marker(
+        self, manager, seeded_switcher, fake_claude, no_gate, block_real_keychain
+    ):
+        """§4.2: a logged-out own profile is NOT re-seeded from the backup —
+        that would bring back the copied family the own login removed."""
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+        service = keychain_service_name(session_dir)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, OWN_CREDS)
+        fake_claude.status_valid = False
+
+        with pytest.raises(SessionError) as exc:
+            manager.setup_session("2", share=False)
+
+        msg = str(exc.value)
+        assert "session login is not valid" in msg
+        assert "cswap session login 2" in msg
+        assert session_dir.is_dir()
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+        assert block_real_keychain.get_password(service, account) == OWN_CREDS
+        assert session_mod.own_login_state(session_dir) == "own"
+        assert no_gate == []
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+
+    def test_own_login_as_another_account_is_invalid_not_reseeded(
+        self, manager, seeded_switcher, fake_claude, no_gate
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+        (session_dir / ".claude.json").write_text(_identity(OTHER_EMAIL, ""))
+
+        with pytest.raises(SessionError, match="session login is not valid"):
+            manager.setup_session("2", share=False)
+
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+
+    def test_unknown_probe_is_judged_by_local_artifacts(
+        self, manager, seeded_switcher, monkeypatch, no_gate
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+
+        def timeout(*a, **k):
+            raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", timeout)
+
+        assert manager.setup_session("2", share=False)[0] == session_dir
+
+        (session_dir / ".credentials.json").unlink()
+        with pytest.raises(SessionError, match="session login is not valid"):
+            manager.setup_session("2", share=False)
+        assert session_dir.is_dir()
+        assert session_mod.own_login_state(session_dir) == "own"
+
+
+class TestOwnLoginRun:
+    """§5 item 7: an own login always runs in its profile; pending refuses."""
+
+    def _default_login_is_account_2(self, manager, monkeypatch):
+        monkeypatch.setattr(
+            manager.switcher, "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+
+    @pytest.mark.parametrize("require_session", [False, True])
+    def test_own_profile_runs_in_session_even_on_the_default_login(
+        self, manager, seeded_switcher, capture_exec, fake_claude, monkeypatch,
+        require_session,
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+        self._default_login_is_account_2(manager, monkeypatch)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [], require_session=require_session)
+
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+
+    @pytest.mark.parametrize("on_default_login", [False, True])
+    def test_pending_profile_refuses_to_run(
+        self, manager, seeded_switcher, capture_exec, fake_claude, monkeypatch,
+        on_default_login,
+    ):
+        _seed_marked_profile(seeded_switcher, "pending")
+        if on_default_login:
+            self._default_login_is_account_2(manager, monkeypatch)
+
+        with pytest.raises(SessionError) as exc:
+            manager.run("2", [])
+
+        msg = str(exc.value)
+        assert "cswap session login 2" in msg
+        assert "cswap session logout 2" in msg
+
+
+class TestOwnLoginAuthEnv:
+    """§5 item 10: a marked profile's auth env never carries
+    CLAUDE_SECURESTORAGE_CONFIG_DIR — empty (the default login's store) or
+    another directory. Unmarked profiles keep today's env exactly."""
+
+    VALUES = ["", "/some/other/profile"]
+
+    @pytest.mark.parametrize("value", VALUES)
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_probe_env_drops_it_for_marked_profiles(
+        self, tmp_path, monkeypatch, value, state
+    ):
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+        session_mod.write_own_login_marker(tmp_path, state, ACCOUNT_EMAIL, "")
+        env = _probe_env(tmp_path)
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
+        assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+
+    @pytest.mark.parametrize("value", VALUES)
+    def test_probe_env_keeps_it_for_unmarked_profiles(
+        self, tmp_path, monkeypatch, value
+    ):
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+        assert _probe_env(tmp_path)["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == value
+
+    @pytest.mark.parametrize("value", VALUES)
+    def test_validation_and_run_env_of_an_own_profile(
+        self, manager, seeded_switcher, capture_exec, fake_claude, monkeypatch,
+        value,
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        status_envs = [env for args, env in fake_claude.calls if args[:2] == ("auth", "status")]
+        assert status_envs, "premise: the own profile was validated"
+        for env in [*status_envs, exc.value.env]:
+            assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
+            assert "ANTHROPIC_API_KEY" not in env
+            assert env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+
+    @pytest.mark.parametrize("value", VALUES)
+    def test_run_env_of_an_unmarked_profile_is_unchanged(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch, value,
+    ):
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert exc.value.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == value
+        assert all(
+            env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == value
+            for env in auth_status_tracks_seed
+        )
+
+    @pytest.mark.parametrize("value", VALUES)
+    def test_login_and_logout_env(
+        self, manager, seeded_switcher, fake_claude, monkeypatch, value
+    ):
+        session_dir = _profile(seeded_switcher)
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+
+        manager.login("2")
+        manager.logout("2")
+
+        seen = {args[:2] for args in fake_claude.args()}
+        assert {("auth", "login"), ("auth", "status"), ("auth", "logout")} <= seen
+        for _args, env in fake_claude.calls:
+            assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
+            assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+            assert env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+
+
+class _ReentryGuardLock:
+    """FileLock stand-in that records acquisitions and refuses re-entry, the
+    way the real non-reentrant flock would deadlock."""
+
+    held: set[str] = set()
+    events: list[tuple] = []
+
+    def __init__(self, lock_path, timeout: float = 10.0):
+        self.key = str(lock_path)
+
+    def acquire(self, timeout=None) -> bool:
+        if self.key in self.held:
+            raise AssertionError(f"nested acquisition of {self.key}")
+        self.held.add(self.key)
+        self.events.append(("acquire", self.key))
+        return True
+
+    def release(self) -> None:
+        self.held.discard(self.key)
+        self.events.append(("release", self.key))
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+class TestSessionLogin:
+    """§5 item 8."""
+
+    def test_success_marks_own_and_leaves_the_backup_alone(
+        self, manager, seeded_switcher, fake_claude
+    ):
+        session_dir = _profile(seeded_switcher)
+
+        assert manager.login("2") == (ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+        assert session_mod.own_login_state(session_dir) == "own"
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+        login = next(a for a in fake_claude.args() if a[:2] == ("auth", "login"))
+        assert login == ("auth", "login", "--claudeai", "--email", ACCOUNT_EMAIL)
+        config = json.loads((session_dir / ".claude.json").read_text())
+        assert config["oauthAccount"]["emailAddress"] == ACCOUNT_EMAIL
+
+    def test_fresh_profile_is_seeded_before_login(
+        self, manager, seeded_switcher, monkeypatch
+    ):
+        """The directory and its identity/onboarding seed exist by the time
+        `claude auth login` runs."""
+        session_dir = _profile(seeded_switcher)
+        seen: dict = {}
+
+        def fake(cmd, env=None, **kwargs):
+            if cmd[1:3] == ["auth", "login"]:
+                seen["config"] = json.loads(
+                    (session_dir / ".claude.json").read_text()
+                )
+                seen["state"] = session_mod.own_login_state(session_dir)
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            raise AssertionError(cmd)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", fake)
+        monkeypatch.setattr(session_mod.shutil, "which", lambda n: "/fake/claude")
+
+        with pytest.raises(SessionError, match="has not finished"):
+            manager.login("2")
+
+        assert seen["state"] == "pending"
+        assert seen["config"]["hasCompletedOnboarding"] is True
+        assert seen["config"]["theme"] == "light"
+        assert seen["config"]["oauthAccount"]["emailAddress"] == ACCOUNT_EMAIL
+
+    def test_absorb_and_pending_share_one_lock_section_without_nesting(
+        self, manager, seeded_switcher, fake_claude, monkeypatch
+    ):
+        """A copied profile ahead of the backup is absorbed (pure store write)
+        and the marker written in ONE section of the non-reentrant lock; the
+        flip to `own` takes a second section after the login."""
+        session_dir = _seed_marked_profile(seeded_switcher, None, ROTATED_CREDS)
+        _ReentryGuardLock.held = set()
+        _ReentryGuardLock.events = events = []
+        monkeypatch.setattr(session_mod, "FileLock", _ReentryGuardLock)
+        monkeypatch.setattr("claude_swap.switcher.FileLock", _ReentryGuardLock)
+        lock = str(seeded_switcher.lock_file)
+
+        store_write = seeded_switcher._store._write_account_credentials
+
+        def absorb(num, email, creds):
+            events.append(("absorb", creds, lock in _ReentryGuardLock.held))
+            store_write(num, email, creds)
+
+        monkeypatch.setattr(
+            seeded_switcher._store, "_write_account_credentials", absorb
+        )
+        write_marker = session_mod.write_own_login_marker
+
+        def marker(path, state, email, org):
+            events.append(("marker", state, lock in _ReentryGuardLock.held))
+            write_marker(path, state, email, org)
+
+        monkeypatch.setattr(session_mod, "write_own_login_marker", marker)
+
+        def no_adopt(*a, **k):
+            raise AssertionError("_adopt_session_credential takes the lock itself")
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_adopt_session_credential", no_adopt
+        )
+
+        manager.login("2")
+
+        assert events == [
+            ("acquire", lock),
+            ("absorb", ROTATED_CREDS, True),
+            ("marker", "pending", True),
+            ("release", lock),
+            ("acquire", lock),
+            ("marker", "own", True),
+            ("release", lock),
+        ]
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == ROTATED_CREDS
+        assert session_mod.own_login_state(session_dir) == "own"
+
+    def test_profile_on_the_backup_generation_is_not_absorbed(
+        self, manager, seeded_switcher, fake_claude, monkeypatch
+    ):
+        _seed_marked_profile(seeded_switcher, None, CREDS)
+        writes: list[str] = []
+        monkeypatch.setattr(
+            seeded_switcher._store, "_write_account_credentials",
+            lambda num, email, creds: writes.append(creds),
+        )
+
+        manager.login("2")
+
+        assert writes == []
+
+    @pytest.mark.parametrize(
+        "mode", ["cancel", "partial", "other_account", "noop", "interrupt"]
+    )
+    def test_failed_login_stays_pending_and_run_refuses(
+        self, manager, seeded_switcher, fake_claude, capture_exec, mode
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, None, CREDS)
+        fake_claude.login = mode
+
+        with pytest.raises(SessionError, match="has not finished"):
+            manager.login("2")
+
+        assert session_mod.own_login_state(session_dir) == "pending"
+        with pytest.raises(SessionError, match="has not finished"):
+            manager.run("2", [])
+        logouts = [a for a in fake_claude.args() if a[:2] == ("auth", "logout")]
+        if mode == "other_account":
+            assert logouts == [("auth", "logout")]
+            assert not (session_dir / ".credentials.json").exists()
+        else:
+            assert logouts == []
+
+    def test_pending_credential_is_not_absorbed_by_list_or_the_refresh_gate(
+        self, manager, seeded_switcher, fake_claude, monkeypatch
+    ):
+        """A login that wrote a new family and then failed leaves a profile
+        that LOOKS like a copied profile ahead of the backup. Neither a
+        concurrent `list` (adoption) nor the backup refresh gate (profile
+        precedence) may move it into the backup."""
+        session_dir = _profile(seeded_switcher)
+        fake_claude.login = "partial"
+        with pytest.raises(SessionError):
+            manager.login("2")
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+        assert session_mod.own_login_state(session_dir) == "pending"
+
+        fetched: list[tuple] = []
+
+        def fake_fetch(num, email, creds, is_active=False, **kwargs):
+            fetched.append((num, creds, is_active))
+            return oauth.UsageOutcome(None)
+
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account", fake_fetch
+        )
+        seeded_switcher.list_accounts(json_output=True)
+
+        posted: list[str] = []
+
+        def fake_refresh(creds, **kwargs):
+            posted.append(creds)
+            return oauth.RefreshOutcome(None, "transient")
+
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_refresh_oauth_credentials", fake_refresh
+        )
+        seeded_switcher.consume_backup_grant(ACCOUNT_NUM, ACCOUNT_EMAIL, CREDS)
+
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+        assert (ACCOUNT_NUM, CREDS, False) in fetched
+        assert posted == [CREDS]
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+
+    def test_failed_relogin_of_an_own_profile_stays_pending(
+        self, manager, seeded_switcher, fake_claude, capture_exec, no_gate
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+        fake_claude.login = "cancel"
+
+        with pytest.raises(SessionError, match="has not finished"):
+            manager.login("2")
+
+        assert session_mod.own_login_state(session_dir) == "pending"
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+        with pytest.raises(SessionError, match="has not finished"):
+            manager.run("2", [])
+        assert no_gate == []
+
+    def test_relogin_of_an_own_profile_succeeds(
+        self, manager, seeded_switcher, fake_claude
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "own", OTHER_CREDS)
+
+        manager.login("2")
+
+        assert session_mod.own_login_state(session_dir) == "own"
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+
+    def test_live_session_is_refused_before_anything_changes(
+        self, manager, seeded_switcher, fake_claude
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, None, ROTATED_CREDS)
+        make_live(session_dir)
+
+        with pytest.raises(SessionError, match="live session-mode"):
+            manager.login("2")
+
+        assert session_mod.own_login_state(session_dir) is None
+        assert fake_claude.calls == []
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+
+    def test_unreadable_session_record_is_refused(
+        self, manager, seeded_switcher, fake_claude
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, None, CREDS)
+        (session_dir / "sessions").mkdir()
+        (session_dir / "sessions" / "9999.json").write_text("not json{{{")
+
+        with pytest.raises(SessionError, match="could not be read"):
+            manager.login("2")
+
+        assert session_mod.own_login_state(session_dir) is None
+        assert fake_claude.calls == []
+
+    def test_api_key_account_is_refused(self, manager, seeded_switcher, fake_claude):
+        data = seeded_switcher._get_sequence_data()
+        data["accounts"][ACCOUNT_NUM]["kind"] = "api_key"
+        seeded_switcher._write_json(seeded_switcher.sequence_file, data)
+
+        with pytest.raises(SessionError, match="API-key account"):
+            manager.login("2")
+
+        assert not _profile(seeded_switcher).exists()
+        assert fake_claude.calls == []
+
+    def test_setup_token_account_is_refused(
+        self, manager, seeded_switcher, fake_claude
+    ):
+        seeded_switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL,
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-x"}}),
+        )
+
+        with pytest.raises(SessionError, match="setup-token account"):
+            manager.login("2")
+
+        assert not _profile(seeded_switcher).exists()
+        assert fake_claude.calls == []
+
+
+class TestSessionLogout:
+    """§5 item 9."""
+
+    @pytest.mark.parametrize("state", ["pending", "own"])
+    def test_removes_credentials_keychain_item_and_marker(
+        self, manager, seeded_switcher, fake_claude, block_real_keychain, state
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, state)
+        service = keychain_service_name(session_dir)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, OWN_CREDS)
+
+        assert manager.logout("2") == (ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+        assert ("auth", "logout") in fake_claude.args()
+        assert not (session_dir / ".credentials.json").exists()
+        assert block_real_keychain.get_password(service, account) is None
+        assert session_mod.own_login_state(session_dir) is None
+        assert (session_dir / ".claude.json").exists()  # history kept
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+
+    def test_backup_family_left_by_a_failed_login_is_not_logged_out(
+        self, manager, seeded_switcher, fake_claude
+    ):
+        """A pending profile still holding the backup's copied family: that
+        family is the backup's (and maybe the default login's), so only the
+        local copy goes."""
+        session_dir = _seed_marked_profile(seeded_switcher, "pending", CREDS)
+
+        manager.logout("2")
+
+        assert fake_claude.calls == []
+        assert not (session_dir / ".credentials.json").exists()
+        assert session_mod.own_login_state(session_dir) is None
+
+    def test_next_run_seeds_from_the_backup_again(
+        self, manager, seeded_switcher, fake_claude, capture_exec, refresh_rotates,
+        auth_status_tracks_seed,
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+        manager.logout("2")
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+
+    def test_live_session_is_refused(self, manager, seeded_switcher, fake_claude):
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+        make_live(session_dir)
+
+        with pytest.raises(SessionError, match="live session-mode"):
+            manager.logout("2")
+
+        assert fake_claude.calls == []
+        assert (session_dir / ".credentials.json").read_text() == OWN_CREDS
+        assert session_mod.own_login_state(session_dir) == "own"
+
+    def test_unmarked_profile_is_refused(self, manager, seeded_switcher, fake_claude):
+        session_dir = _seed_marked_profile(seeded_switcher, None, CREDS)
+
+        with pytest.raises(SessionError, match="no session login of its own"):
+            manager.logout("2")
+
+        assert fake_claude.calls == []
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
+    def test_undeletable_keychain_item_keeps_the_marker(
+        self, manager, seeded_switcher, fake_claude, block_real_keychain,
+        monkeypatch,
+    ):
+        session_dir = _seed_marked_profile(seeded_switcher, "own")
+        service = keychain_service_name(session_dir)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, OWN_CREDS)
+        monkeypatch.setattr(session_mod, "delete_macos_keychain_entry", lambda d: None)
+
+        with pytest.raises(SessionError, match="session login is kept"):
+            manager.logout("2")
+
+        assert session_mod.own_login_state(session_dir) == "own"
