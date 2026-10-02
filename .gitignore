@@ -9,5 +9,11 @@ wheels/
 # Virtual environments
 .venv
 
-# superpowers session planning artifacts (not part of the project)
-docs/superpowers/
+# workflow worktrees (fork)
+.worktrees/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
