@@ -111,6 +111,10 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 # first mirror land here (write-once) instead of vanishing.
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
 
+# Per-project folder-trust flag in .claude.json ``projects[<path>]``, mirrored
+# (true only) from the default profile for the launch cwd.
+TRUST_KEY = "hasTrustDialogAccepted"
+
 
 def stale_marker_for(session_dir: Path) -> Path:
     """Where a profile's stale marker is WRITTEN: a SIBLING of the profile dir.
@@ -1455,6 +1459,8 @@ class SessionManager:
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
+        if share:
+            self._sync_folder_trust(session_dir)
         # History links are POSIX-only (run() rejects the flag on Windows;
         # this also drops any links left by a POSIX→Windows profile move).
         if self.switcher.platform == Platform.WINDOWS:
@@ -1665,6 +1671,106 @@ class SessionManager:
             self._logger.warning(
                 f"Could not sync MCP servers ({e}) — skipping this launch."
             )
+
+    def _sync_folder_trust(self, session_dir: Path) -> None:
+        """Copy the default profile's folder trust for the launch cwd.
+
+        Claude asks "Do you trust this folder?" per profile, keyed by the
+        project path (a worktree's canonical git root) or any trusted
+        ancestor. A session profile has never seen that answer, so an
+        unattended relaunch after an account switch stalls on the dialog.
+        Only ``true`` is copied, and only for keys that apply to the cwd; a
+        trust the profile already holds is never lowered or removed.
+
+        Fail-open like the MCP mirror: a symlinked or non-regular profile
+        config, unreadable JSON on either side, or a contended lock leaves
+        the profile untouched and never blocks the launch.
+        """
+        source = self._load_json_object(get_default_global_config_path())
+        source_projects = source.get("projects") if source else None
+        if not isinstance(source_projects, dict):
+            return
+        trusted = {
+            key
+            for key, value in source_projects.items()
+            if isinstance(value, dict) and value.get(TRUST_KEY) is True
+        }
+        if not trusted:
+            return  # skip the git probe when nothing could be mirrored
+        keys = [key for key in self._trust_candidate_keys() if key in trusted]
+        if not keys:
+            return
+
+        config_path = session_dir / ".claude.json"
+
+        def missing(config: dict) -> list[str] | None:
+            projects = config.get("projects", {})
+            if not isinstance(projects, dict):
+                return None
+            if any(
+                key in projects and not isinstance(projects[key], dict)
+                for key in keys
+            ):
+                return None
+            return [
+                key for key in keys
+                if projects.get(key, {}).get(TRUST_KEY) is not True
+            ]
+
+        if config_path.is_symlink() or not config_path.is_file():
+            return  # bootstrap/validation owns a missing config
+        existing = self._load_json_object(config_path)
+        if existing is None or not missing(existing):
+            return
+
+        lock_dir = config_path.parent / (config_path.name + ".lock")
+        try:
+            with proper_lockfile(lock_dir):
+                if config_path.is_symlink() or not config_path.is_file():
+                    return
+                existing = self._load_json_object(config_path)
+                if existing is None:
+                    return
+                todo = missing(existing)
+                if not todo:
+                    return
+                projects = existing.setdefault("projects", {})
+                for key in todo:
+                    projects.setdefault(key, {})[TRUST_KEY] = True
+                try:
+                    atomic_write_json(config_path, existing)
+                except OSError as e:
+                    self._logger.warning(f"Could not sync folder trust: {e}")
+        except (ClaudeCodeLockTimeout, OSError) as e:
+            self._logger.warning(
+                f"Could not sync folder trust ({e}) — skipping this launch."
+            )
+
+    @staticmethod
+    def _trust_candidate_keys() -> list[str]:
+        """Config keys Claude consults for the cwd's trust, NFC-normalized.
+
+        The project key (the canonical git root shared by all worktrees of a
+        repository, else the cwd), then the cwd and each of its ancestors.
+        """
+        try:
+            cwd = Path.cwd()
+        except OSError:
+            return []
+        keys: list[str] = []
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                cwd=cwd, capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None and result.returncode == 0 and result.stdout.strip():
+            keys.append(str(Path(result.stdout.strip()).parent))
+        keys.extend(str(p) for p in (cwd, *cwd.parents))
+        return list(
+            dict.fromkeys(unicodedata.normalize("NFC", key) for key in keys)
+        )
 
     @staticmethod
     def _read_mcp_source() -> dict | None:

@@ -1264,6 +1264,184 @@ class TestMcpMirror:
         assert _session_config(session_dir)["mcpServers"] == {"github": GITHUB_MCP}
 
 
+def _git(*args: str, cwd: Path) -> None:
+    import subprocess
+
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_COUNT": "0",
+    }
+    env.pop("GIT_CONFIG_PARAMETERS", None)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+        cwd=cwd, env=env, check=True, capture_output=True,
+    )
+
+
+def _set_default_projects(default_config: Path, projects: dict) -> None:
+    data = json.loads(default_config.read_text())
+    data["projects"] = projects
+    default_config.write_text(json.dumps(data))
+
+
+class TestFolderTrustMirror:
+    @pytest.fixture
+    def worktree(self, temp_home, monkeypatch):
+        """A repo with a linked worktree; the launch cwd is inside the latter."""
+        repo = (temp_home / "repo").resolve()
+        repo.mkdir()
+        _git("init", "-q", cwd=repo)
+        _git("commit", "-q", "--allow-empty", "-m", "init", cwd=repo)
+        wt = repo / ".worktrees" / "feature"
+        _git("worktree", "add", "-q", str(wt), cwd=repo)
+        monkeypatch.chdir(wt)
+        return repo, Path.cwd()
+
+    def test_repo_trust_reaches_worktree_launch(self, mcp_setup, worktree):
+        default_config, session_dir, mgr = mcp_setup
+        repo, _ = worktree
+        _set_default_projects(
+            default_config, {str(repo): {"hasTrustDialogAccepted": True}}
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        config = _session_config(session_dir)
+        assert config["projects"][str(repo)] == {"hasTrustDialogAccepted": True}
+        assert config["projects"]["/w"] == {"allowedTools": []}
+        assert config["theme"] == "light"
+
+    def test_trusted_ancestor_is_mirrored(self, mcp_setup, worktree, temp_home):
+        default_config, session_dir, mgr = mcp_setup
+        home = str(temp_home.resolve())
+        _set_default_projects(
+            default_config,
+            {home: {"hasTrustDialogAccepted": True}, "/elsewhere": {
+                "hasTrustDialogAccepted": True}},
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        projects = _session_config(session_dir)["projects"]
+        assert projects[home] == {"hasTrustDialogAccepted": True}
+        assert "/elsewhere" not in projects
+
+    def test_untrusted_default_creates_no_key(self, mcp_setup, worktree):
+        default_config, session_dir, mgr = mcp_setup
+        repo, _ = worktree
+        _set_default_projects(
+            default_config, {str(repo): {"hasTrustDialogAccepted": False}}
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert _session_config(session_dir)["projects"] == {
+            "/w": {"allowedTools": []}
+        }
+
+    def test_existing_session_trust_kept(self, mcp_setup, worktree):
+        default_config, session_dir, mgr = mcp_setup
+        repo, wt = worktree
+        config = _session_config(session_dir)
+        config["projects"][str(wt)] = {
+            "hasTrustDialogAccepted": True, "allowedTools": ["Bash"]
+        }
+        (session_dir / ".claude.json").write_text(json.dumps(config))
+        _set_default_projects(
+            default_config,
+            {
+                str(repo): {"hasTrustDialogAccepted": True},
+                str(wt): {"hasTrustDialogAccepted": False},
+            },
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        projects = _session_config(session_dir)["projects"]
+        assert projects[str(wt)] == {
+            "hasTrustDialogAccepted": True, "allowedTools": ["Bash"]
+        }
+        assert projects[str(repo)] == {"hasTrustDialogAccepted": True}
+
+    def test_no_share_writes_no_trust(self, mcp_setup, worktree):
+        default_config, session_dir, mgr = mcp_setup
+        repo, _ = worktree
+        _set_default_projects(
+            default_config, {str(repo): {"hasTrustDialogAccepted": True}}
+        )
+        before = (session_dir / ".claude.json").read_bytes()
+
+        mgr._sync_sharing(session_dir, share=False)
+
+        assert (session_dir / ".claude.json").read_bytes() == before
+
+    def test_non_git_cwd_uses_cwd(self, mcp_setup, temp_home, monkeypatch):
+        default_config, session_dir, mgr = mcp_setup
+        plain = (temp_home / "plain").resolve()
+        plain.mkdir()
+        monkeypatch.chdir(plain)
+        _set_default_projects(
+            default_config, {str(plain): {"hasTrustDialogAccepted": True}}
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert _session_config(session_dir)["projects"][str(plain)] == {
+            "hasTrustDialogAccepted": True
+        }
+
+    @pytest.mark.parametrize("bad", ["corrupt", "symlink", "bad_projects"])
+    def test_fail_open(self, mcp_setup, worktree, temp_home, bad):
+        default_config, session_dir, mgr = mcp_setup
+        repo, _ = worktree
+        _set_default_projects(
+            default_config, {str(repo): {"hasTrustDialogAccepted": True}}
+        )
+        config_path = session_dir / ".claude.json"
+        if bad == "corrupt":
+            config_path.write_text("{broken")
+        elif bad == "symlink":
+            if sys.platform == "win32":
+                pytest.skip("symlink target check")
+            elsewhere = temp_home / "elsewhere.json"
+            config_path.rename(elsewhere)
+            config_path.symlink_to(elsewhere)
+        else:
+            data = _session_config(session_dir)
+            data["projects"] = ["not-a-dict"]
+            data.pop("mcpServers", None)
+            config_path.write_text(json.dumps(data))
+        target = config_path.resolve()
+
+        mgr._sync_folder_trust(session_dir)
+
+        if bad == "corrupt":
+            assert config_path.read_text() == "{broken"
+        elif bad == "symlink":
+            assert config_path.is_symlink()
+            assert str(repo) not in json.loads(target.read_text())["projects"]
+        else:
+            assert _session_config(session_dir)["projects"] == ["not-a-dict"]
+
+    def test_held_lock_fails_open(self, mcp_setup, worktree, monkeypatch):
+        from claude_swap import claude_locks
+
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
+        default_config, session_dir, mgr = mcp_setup
+        repo, _ = worktree
+        _set_default_projects(
+            default_config, {str(repo): {"hasTrustDialogAccepted": True}}
+        )
+        (session_dir / ".claude.json.lock").mkdir()
+        before = (session_dir / ".claude.json").read_bytes()
+
+        mgr._sync_folder_trust(session_dir)
+
+        assert (session_dir / ".claude.json").read_bytes() == before
+
+
 # ---------------------------------------------------------------------------
 # run() / exec handoff
 # ---------------------------------------------------------------------------
