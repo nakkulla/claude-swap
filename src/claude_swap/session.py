@@ -634,22 +634,30 @@ class LoginFailure(SessionError):
         self.code = code
 
 
-def remove_login_profile(profile: Path) -> bool:
-    """Delete a `cswap login` profile and its keychain item; False if any is left.
+def remove_login_profile(profile: Path) -> list[str]:
+    """Delete a `cswap login` profile and its keychain item; return what is left.
 
-    The keychain item goes first. When it cannot be deleted the directory is
-    kept, because the next sweep finds the item only through it. Never runs
-    `claude auth logout`: that would revoke the token family just stored.
+    When the keychain item cannot be deleted the directory is emptied but
+    kept: the item's name is hashed from the profile path, so the next sweep
+    finds it only through the directory. Never runs `claude auth logout`:
+    that would revoke the token family just stored.
     """
+    left: list[str] = []
     if Platform.detect() == Platform.MACOS:
+        service = keychain_service_name(profile)
         try:
-            macos_keychain.delete_password(
-                keychain_service_name(profile), _keychain_account_name()
-            )
+            macos_keychain.delete_password(service, _keychain_account_name())
         except macos_keychain.KEYCHAIN_ERRORS:
-            return False
+            left.append(f"keychain item '{service}'")
     shutil.rmtree(profile, ignore_errors=True)
-    return not profile.exists()
+    if left:
+        try:
+            profile.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+    if profile.exists():
+        left.append(str(profile))
+    return left
 
 
 def sweep_login_profiles(
@@ -667,7 +675,7 @@ def sweep_login_profiles(
             )
         except OSError:
             continue
-        if stale and not remove_login_profile(entry):
+        if stale and remove_login_profile(entry):
             left.append(entry)
     return left
 
@@ -1344,7 +1352,7 @@ class SessionManager:
         Only the child gets ``CLAUDE_CONFIG_DIR``; this process's env is never
         touched, and the profile is read by explicit path. The profile and its
         keychain item are deleted on every path, after the child is stopped;
-        one that could not be deleted is appended to ``leftovers``.
+        what could not be deleted is appended to ``leftovers``.
         """
         switcher = self.switcher
         switcher._refuse_session_shell()
@@ -1418,11 +1426,12 @@ class SessionManager:
                 return switcher.save_isolated_login(config_text, creds, target)
             finally:
                 signals.hold()
-                if profile is not None and not remove_login_profile(profile):
+                left = remove_login_profile(profile) if profile is not None else []
+                if left:
                     if leftovers is not None:
-                        leftovers.append(str(profile))
+                        leftovers.extend(left)
                     self._logger.warning(
-                        "Could not remove the temporary login profile %s", profile
+                        "Could not remove the temporary login's %s", ", ".join(left)
                     )
 
     def _stored_identity(self, account_num: str, email: str) -> tuple[dict, str]:

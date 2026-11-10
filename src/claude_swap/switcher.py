@@ -304,13 +304,6 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 
 
 
-class AmbiguousAccountError(ConfigError):
-    """An email identifier matches more than one slot. ``code`` is its
-    ``--json`` error code (``cswap login`` / ``remove --yes``)."""
-
-    code = "ambiguous_account"
-
-
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -3416,8 +3409,8 @@ class ClaudeAccountSwitcher:
         Resolution precedence: number -> alias -> email.
 
         Raises:
-            AmbiguousAccountError: (a ConfigError) if the email matches
-                multiple accounts.
+            ConfigError: if the email matches multiple accounts (ambiguous);
+                its ``code`` attribute is ``"ambiguous_account"``.
         """
         if identifier.isdigit():
             return identifier
@@ -3444,10 +3437,15 @@ class ClaudeAccountSwitcher:
             f"{num} [{data['accounts'][num].get('organizationName') or 'personal'}]"
             for num in matches
         )
-        raise AmbiguousAccountError(
+        ambiguous = ConfigError(
             f"Email '{identifier}' is ambiguous — matches accounts: {details}. "
             f"Use account number instead (e.g., cswap --switch-to 1)."
         )
+        # The `--json` error code of `cswap login` / `remove --yes`. Data on
+        # the instance, not a subclass: the `switch --json` error envelope
+        # names the class, and it has always said ConfigError.
+        ambiguous.code = "ambiguous_account"
+        raise ambiguous
 
     def _get_sequence_data_migrated(self) -> dict | None:
         """Get sequence data, ensuring org-field migration has run."""
@@ -4160,8 +4158,8 @@ class ClaudeAccountSwitcher:
 
         When ``assume_yes`` is True the confirmation prompt is skipped (used by
         the TUI, which collects confirmation before calling, and by
-        ``cswap remove --yes``), and an ambiguous email raises
-        ``AmbiguousAccountError`` instead of asking which slot. Returns the
+        ``cswap remove --yes``), and an ambiguous email raises ConfigError
+        (code ``ambiguous_account``) instead of asking which slot. Returns the
         removed ``(account_num, email)``, or None when the prompt cancelled.
         """
         self._refuse_session_shell()
@@ -4179,7 +4177,8 @@ class ClaudeAccountSwitcher:
 
             # For email identifiers, handle ambiguous matches interactively —
             # except under assume_yes, where nobody answers: fall through to
-            # _resolve_account_identifier, which raises AmbiguousAccountError.
+            # _resolve_account_identifier, which raises a ConfigError listing
+            # the matching slots (as switch_to does in JSON mode).
             # Aliases are unique by construction, so they never hit this.
             if not assume_yes and not is_alias:
                 data = self._get_sequence_data()

@@ -8650,18 +8650,16 @@ class TestRemoveAccountAssumeYes:
     def test_ambiguous_email_raises_instead_of_asking(
         self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch,
     ):
-        from claude_swap.switcher import AmbiguousAccountError
-
         switcher = self._switcher(sample_sequence_data_with_org)
 
         def no_prompt(*args, **kwargs):
             raise AssertionError("assume_yes must not prompt")
 
         monkeypatch.setattr("builtins.input", no_prompt)
-        with pytest.raises(AmbiguousAccountError) as exc:
+        with pytest.raises(ConfigError, match="ambiguous") as exc:
             switcher.remove_account("user@example.com", assume_yes=True)
 
-        assert isinstance(exc.value, ConfigError)
+        assert type(exc.value) is ConfigError
         assert exc.value.code == "ambiguous_account"
         assert sorted(switcher._get_sequence_data()["accounts"]) == ["1", "2"]
 
@@ -8682,15 +8680,16 @@ class TestRemoveAccountAssumeYes:
 
         assert switcher.remove_account("user@example.com") == ("2", "user@example.com")
 
-    def test_resolve_account_raises_the_ambiguity_subclass(
+    def test_resolve_account_ambiguity_carries_its_code(
         self, temp_home: Path, sample_sequence_data_with_org: dict,
     ):
-        from claude_swap.switcher import AmbiguousAccountError
-
         switcher = self._switcher(sample_sequence_data_with_org)
 
-        with pytest.raises(AmbiguousAccountError):
+        with pytest.raises(ConfigError) as exc:
             switcher.resolve_account("user@example.com")
+
+        assert type(exc.value) is ConfigError
+        assert exc.value.code == "ambiguous_account"
 
 
 class TestAddAccountAlias:

@@ -425,8 +425,8 @@ Examples:
     )
     if leftovers:
         note = (
-            "Could not remove the temporary login profile "
-            f"{', '.join(leftovers)}; delete it by hand."
+            f"Could not remove {', '.join(leftovers)}; a later `cswap login` "
+            "retries."
         )
         payload["message"] = f"{payload['message']} {note}" if "message" in payload else note
         if not args.json:

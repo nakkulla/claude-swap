@@ -2026,13 +2026,14 @@ class TestLoginCommand:
         ("lock", "login_failed"),
     ])
     def test_failure_is_a_json_line_with_its_code(self, capsys, exc, code):
-        from claude_swap.exceptions import AccountNotFoundError, LockError
+        from claude_swap.exceptions import AccountNotFoundError, ConfigError, LockError
         from claude_swap.session import LoginFailure
-        from claude_swap.switcher import AmbiguousAccountError
 
+        ambiguous = ConfigError("Email 'a@x.com' is ambiguous")
+        ambiguous.code = "ambiguous_account"  # what the resolver attaches
         raised = {
             "not_found": AccountNotFoundError("No account found with identifier: 9"),
-            "ambiguous": AmbiguousAccountError("Email 'a@x.com' is ambiguous"),
+            "ambiguous": ambiguous,
             "lock": LockError("Failed to acquire lock"),
         }.get(exc) or LoginFailure(exc, f"{exc} happened")
 
@@ -2257,6 +2258,19 @@ class TestRemoveScripted:
         assert excinfo.value.code == 2
         assert "--json needs --yes" in capsys.readouterr().err
         assert "3" in switcher._get_sequence_data()["accounts"]
+
+    def test_switch_json_envelope_still_names_config_error(self, temp_home, capsys):
+        """The ambiguity's code rides on the instance: `switch --json`'s
+        envelope keeps naming the class it always named."""
+        self._seed()
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._main(["switch", "dup@x.com", "--json"])
+
+        assert excinfo.value.code == 1
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["error"]["type"] == "ConfigError"
+        assert "ambiguous" in envelope["error"]["message"]
 
     def test_plain_remove_keeps_the_interactive_prompt(self, temp_home):
         switcher = self._seed()

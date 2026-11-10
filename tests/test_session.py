@@ -4578,9 +4578,18 @@ class TestIsolatedLogin:
         assert young.exists()
         assert block_real_keychain.data[_login_item(young)] == "leftover"
 
-    def test_cleanup_failure_keeps_the_result_and_reports_the_path(
+    def test_cleanup_failure_keeps_the_result_and_reports_what_is_left(
         self, manager, seeded_switcher, login_child, monkeypatch
     ):
+        land = _land_login()
+
+        def on_wait(child):
+            land(child)
+            # The plaintext fallback claude writes when the keychain fails.
+            (child.profile / ".credentials.json").write_text(LOGIN_CREDS)
+
+        login_child.on_wait = on_wait
+
         def locked(service, account):
             raise macos_keychain.KeychainError("locked")
 
@@ -4591,8 +4600,13 @@ class TestIsolatedLogin:
 
         assert result[0] == "updated"
         profile = login_child.children[0].profile
-        assert leftovers == [str(profile)]
-        assert profile.exists()  # kept so the next sweep finds the item
+        assert leftovers == [
+            f"keychain item '{keychain_service_name(profile)}'", str(profile),
+        ]
+        # Emptied, credential file included, but kept: the next sweep finds
+        # the keychain item only through the directory.
+        assert profile.is_dir() and list(profile.iterdir()) == []
+        assert "login-access" not in " ".join(leftovers)  # names, never tokens
 
     def test_missing_claude_is_login_incomplete(self, manager, seeded_switcher, monkeypatch):
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
