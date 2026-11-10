@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -579,17 +580,20 @@ def _mkdir_private(path: Path) -> None:
         directory.mkdir(mode=0o700, exist_ok=True)
 
 
-def _probe_env(session_dir: Path) -> dict[str, str]:
+def _probe_env(
+    session_dir: Path, *, drop_secure_storage: bool = False
+) -> dict[str, str]:
     """Env for the auth-status probe: session config dir, auth overrides dropped.
 
     Also the launch env of `cswap run` and the env of `cswap session
     login/logout`. For an own-login profile ``CLAUDE_SECURESTORAGE_CONFIG_DIR``
     is dropped too, whatever its value: defined at all (empty included) it
     points claude at another secure store than the profile's own, which is
-    the one place that profile's token family lives.
+    the one place that profile's token family lives. ``drop_secure_storage``
+    drops it for an unmarked profile as well (`cswap login`'s temporary one).
     """
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
-    if own_login_state(session_dir) is not None:
+    if drop_secure_storage or own_login_state(session_dir) is not None:
         env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
     return env
@@ -608,6 +612,128 @@ def _invalid_login_message(account_num: str, email: str) -> str:
         f"Account-{account_num} ({email})'s session login is not valid — "
         f"run `cswap session login {account_num}`."
     )
+
+
+# `cswap login` logs in inside a temporary `login-*` profile under the backup
+# dir: outside sessions/, so it is never a session profile (no marker, no sync
+# path) and `_refuse_session_shell` does not apply to it. A login killed before
+# its cleanup leaves one behind; the next `cswap login` sweeps those older than
+# LOGIN_PROFILE_MAX_AGE and keeps younger ones, which may still be waiting for
+# their code.
+LOGIN_PROFILE_PREFIX = "login-"
+LOGIN_PROFILE_MAX_AGE = 15 * 60  # seconds
+# How long a stopped `claude auth login` gets to exit before it is killed.
+_LOGIN_CHILD_STOP_TIMEOUT = 5.0
+
+
+class LoginFailure(SessionError):
+    """A `cswap login` failure, carrying its stable ``--json`` error code."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def remove_login_profile(profile: Path) -> list[str]:
+    """Delete a `cswap login` profile and its keychain item; return what is left.
+
+    When the keychain item cannot be deleted the directory is emptied but
+    kept: the item's name is hashed from the profile path, so the next sweep
+    finds it only through the directory. Never runs `claude auth logout`:
+    that would revoke the token family just stored.
+    """
+    left: list[str] = []
+    if Platform.detect() == Platform.MACOS:
+        service = keychain_service_name(profile)
+        try:
+            macos_keychain.delete_password(service, _keychain_account_name())
+        except macos_keychain.KEYCHAIN_ERRORS:
+            left.append(f"keychain item '{service}'")
+    shutil.rmtree(profile, ignore_errors=True)
+    if left:
+        try:
+            profile.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+    if profile.exists():
+        left.append(str(profile))
+    return left
+
+
+def sweep_login_profiles(
+    backup_dir: Path, max_age: float = LOGIN_PROFILE_MAX_AGE
+) -> list[Path]:
+    """Remove `login-*` profiles older than ``max_age``; return those left."""
+    cutoff = time.time() - max_age
+    left: list[Path] = []
+    for entry in backup_dir.glob(f"{LOGIN_PROFILE_PREFIX}*"):
+        try:
+            stale = (
+                entry.is_dir()
+                and not entry.is_symlink()
+                and entry.stat().st_mtime < cutoff
+            )
+        except OSError:
+            continue
+        if stale and remove_login_profile(entry):
+            left.append(entry)
+    return left
+
+
+def _start_login_child(argv: list[str], env: dict[str, str]) -> subprocess.Popen:
+    """Start `claude auth login` on this terminal.
+
+    Inherited stdio and the same process group: the login URL and the
+    `Paste code here` prompt must reach the terminal (beads-ui reads them off
+    its tmux pane and types the code back).
+    """
+    return subprocess.Popen(argv, env=env)
+
+
+def _stop_login_child(child: subprocess.Popen) -> None:
+    """Terminate the child and wait for it, so it cannot write into its
+    profile after the profile is deleted."""
+    if child.poll() is not None:
+        return
+    child.terminate()
+    try:
+        child.wait(timeout=_LOGIN_CHILD_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait()
+
+
+class _LoginSignals:
+    """SIGINT, SIGTERM and SIGHUP during `cswap login`.
+
+    While the login runs each raises KeyboardInterrupt, so a closed tmux
+    window (SIGHUP) or a kill (SIGTERM) takes the same cleanup as Ctrl-C.
+    ``hold()`` ignores all three from then on, so a second signal cannot tear
+    the save or the cleanup halfway. The previous handlers come back on exit.
+    """
+
+    def __init__(self) -> None:
+        self._signals = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):  # absent on Windows
+            self._signals.append(signal.SIGHUP)
+        self._previous: dict[int, object] = {}
+
+    @staticmethod
+    def _interrupt(signum, frame) -> None:
+        raise KeyboardInterrupt
+
+    def __enter__(self) -> _LoginSignals:
+        for sig in self._signals:
+            self._previous[sig] = signal.signal(sig, self._interrupt)
+        return self
+
+    def hold(self) -> None:
+        for sig in self._previous:
+            signal.signal(sig, signal.SIG_IGN)
+
+    def __exit__(self, *exc) -> None:
+        for sig, handler in self._previous.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 
 
 class SessionManager:
@@ -1209,6 +1335,104 @@ class SessionManager:
             warning(
                 f"`claude auth logout` exited with status {result.returncode}."
             )
+
+    # -- isolated login (`cswap login`) ------------------------------------
+
+    def isolated_login(
+        self, identifier: str | None, leftovers: list[str] | None = None
+    ) -> tuple[str, str, str, bool]:
+        """`cswap login`: log in inside a temporary profile, store it in a slot.
+
+        ``identifier`` names the slot to log in again; ``None`` (``--new``)
+        adds the account, or updates its slot when it is already stored. The
+        active login and ``activeAccountNumber`` are left alone (see
+        ``save_isolated_login`` for the one exception). Returns
+        ``(outcome, account_num, email, active_refreshed)``.
+
+        Only the child gets ``CLAUDE_CONFIG_DIR``; this process's env is never
+        touched, and the profile is read by explicit path. The profile and its
+        keychain item are deleted on every path, after the child is stopped;
+        what could not be deleted is appended to ``leftovers``.
+        """
+        switcher = self.switcher
+        switcher._refuse_session_shell()
+        switcher._setup_directories()
+        for left in sweep_login_profiles(switcher.backup_dir):
+            self._logger.warning("Could not remove the old login profile %s", left)
+
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            raise LoginFailure(
+                "login_incomplete",
+                "'claude' was not found on PATH. Install Claude Code, then "
+                "retry `cswap login`.",
+            )
+        argv = [claude_bin, "auth", "login", "--claudeai"]
+        target = None
+        if identifier is not None:
+            target = switcher.resolve_account(identifier)
+            num, email, _org = target
+            reason = switcher._isolated_login_unsupported(num, email)
+            if reason:
+                raise LoginFailure("unsupported_account", reason)
+            argv += ["--email", email]
+            print(
+                f"{accent('Logging in')} Account-{num} ({email}) "
+                f"{muted('[isolated login]')}"
+            )
+        else:
+            print(f"{accent('Logging in')} a new account {muted('[isolated login]')}")
+
+        with _LoginSignals() as signals:
+            profile: Path | None = None
+            try:
+                profile = Path(tempfile.mkdtemp(
+                    prefix=LOGIN_PROFILE_PREFIX, dir=switcher.backup_dir
+                ))
+                try:
+                    child = _start_login_child(
+                        argv, _probe_env(profile, drop_secure_storage=True)
+                    )
+                except OSError as e:
+                    raise LoginFailure(
+                        "login_incomplete", f"Could not run `claude auth login`: {e}"
+                    ) from e
+                try:
+                    returncode = child.wait()
+                except BaseException:
+                    signals.hold()
+                    _stop_login_child(child)
+                    raise
+                # The login is over: from here nothing may tear the save or
+                # the cleanup halfway.
+                signals.hold()
+                if returncode != 0:
+                    raise LoginFailure(
+                        "login_incomplete",
+                        f"`claude auth login` did not complete (exit status "
+                        f"{returncode}); nothing was saved.",
+                    )
+                try:
+                    config_text = (profile / ".claude.json").read_text(encoding="utf-8")
+                except (OSError, ValueError):
+                    config_text = ""
+                creds = read_config_dir_credentials(str(profile), strict_keychain=True)
+                if not creds:
+                    raise LoginFailure(
+                        "login_incomplete",
+                        "No credential was found after `claude auth login`; "
+                        "nothing was saved.",
+                    )
+                return switcher.save_isolated_login(config_text, creds, target)
+            finally:
+                signals.hold()
+                left = remove_login_profile(profile) if profile is not None else []
+                if left:
+                    if leftovers is not None:
+                        leftovers.extend(left)
+                    self._logger.warning(
+                        "Could not remove the temporary login's %s", ", ".join(left)
+                    )
 
     def _stored_identity(self, account_num: str, email: str) -> tuple[dict, str]:
         """The slot's stored ``oauthAccount`` and theme, for the profile seed."""

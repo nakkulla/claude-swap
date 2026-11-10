@@ -1959,3 +1959,332 @@ class TestImportUsageCli:
                 cli.main()
         assert exc.value.code == 2
         assert message in capsys.readouterr().err
+
+
+@pytest.fixture(autouse=True)
+def _no_real_login_child(monkeypatch):
+    """Fail closed: no CLI test may start the developer's real
+    `claude auth login` through `cswap login`."""
+
+    def refuse(argv, env):
+        raise AssertionError(f"a test reached the real login launch: {argv}")
+
+    monkeypatch.setattr("claude_swap.session._start_login_child", refuse)
+
+
+def _last_json_line(out: str) -> dict:
+    """The scripted commands' contract: the last stdout line is one
+    unindented JSON object with schemaVersion 1."""
+    last = out.rstrip("\n").splitlines()[-1]
+    payload = json.loads(last)
+    assert isinstance(payload, dict) and payload["schemaVersion"] == 1
+    return payload
+
+
+class TestLoginCommand:
+    """`cswap login NUM|EMAIL|--new [--json]` (claude-swap-3uj §4.1, §4.3)."""
+
+    def _main(self, argv, isolated_login):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.session.SessionManager.isolated_login",
+                   autospec=True, side_effect=isolated_login) as login, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+        return login
+
+    def test_json_success_is_the_last_line(self, capsys):
+        def login(self, identifier, leftovers):
+            print("Logging in Account-2 (a@x.com) [isolated login]")
+            return ("updated", "2", "a@x.com", False)
+
+        mock = self._main(["login", "2", "--json"], login)
+
+        assert mock.call_args.args[1] == "2"
+        out = capsys.readouterr().out
+        assert out.splitlines()[0].startswith("Logging in")
+        assert _last_json_line(out) == {
+            "schemaVersion": 1, "ok": True, "outcome": "updated",
+            "number": 2, "email": "a@x.com",
+        }
+
+    def test_new_passes_no_identifier(self, capsys):
+        mock = self._main(
+            ["login", "--new", "--json"],
+            lambda self, identifier, leftovers: ("added", "3", "n@x.com", False),
+        )
+
+        assert mock.call_args.args[1] is None
+        assert _last_json_line(capsys.readouterr().out)["outcome"] == "added"
+
+    @pytest.mark.parametrize("exc,code", [
+        ("identity_mismatch", "identity_mismatch"),
+        ("login_incomplete", "login_incomplete"),
+        ("unsupported_account", "unsupported_account"),
+        ("not_found", "account_not_found"),
+        ("ambiguous", "ambiguous_account"),
+        ("lock", "login_failed"),
+    ])
+    def test_failure_is_a_json_line_with_its_code(self, capsys, exc, code):
+        from claude_swap.exceptions import AccountNotFoundError, ConfigError, LockError
+        from claude_swap.session import LoginFailure
+
+        ambiguous = ConfigError("Email 'a@x.com' is ambiguous")
+        ambiguous.code = "ambiguous_account"  # what the resolver attaches
+        raised = {
+            "not_found": AccountNotFoundError("No account found with identifier: 9"),
+            "ambiguous": ambiguous,
+            "lock": LockError("Failed to acquire lock"),
+        }.get(exc) or LoginFailure(exc, f"{exc} happened")
+
+        def login(self, identifier, leftovers):
+            raise raised
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._main(["login", "2", "--json"], login)
+
+        assert excinfo.value.code == 1
+        assert _last_json_line(capsys.readouterr().out) == {
+            "schemaVersion": 1, "ok": False, "error": code, "message": str(raised),
+        }
+
+    def test_cancel_is_login_incomplete_with_exit_130(self, capsys):
+        def login(self, identifier, leftovers):
+            raise KeyboardInterrupt
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._main(["login", "2", "--json"], login)
+
+        assert excinfo.value.code == 130
+        payload = _last_json_line(capsys.readouterr().out)
+        assert (payload["ok"], payload["error"]) == (False, "login_incomplete")
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_cleanup_leftover_is_appended_to_the_message(self, capsys, fails):
+        from claude_swap.session import LoginFailure
+
+        def login(self, identifier, leftovers):
+            leftovers.append("/backup/login-abc")
+            if fails:
+                raise LoginFailure("login_incomplete", "did not complete.")
+            return ("updated", "2", "a@x.com", False)
+
+        if fails:
+            with pytest.raises(SystemExit):
+                self._main(["login", "2", "--json"], login)
+        else:
+            self._main(["login", "2", "--json"], login)
+
+        payload = _last_json_line(capsys.readouterr().out)
+        assert payload["ok"] is not fails
+        assert "/backup/login-abc" in payload["message"]
+        assert payload["message"].startswith("did not complete." if fails else "Could not")
+
+    def test_unexpected_error_still_ends_with_json_then_raises(self, capsys):
+        def login(self, identifier, leftovers):
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            self._main(["login", "2", "--json"], login)
+
+        payload = _last_json_line(capsys.readouterr().out)
+        assert (payload["ok"], payload["error"]) == (False, "login_failed")
+
+    def test_human_mode_prints_no_json(self, capsys):
+        self._main(
+            ["login", "2"],
+            lambda self, identifier, leftovers: ("updated", "2", "a@x.com", True),
+        )
+
+        out = capsys.readouterr().out
+        assert "Updated credentials" in out
+        assert "{" not in out
+
+    @pytest.mark.parametrize("argv", [["login"], ["login", "2", "--new"]])
+    def test_target_or_new_is_required(self, argv):
+        with patch.object(sys, "argv", ["claude-swap", *argv]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+
+    def test_end_to_end_json(self, temp_home, capsys):
+        """Through the real SessionManager with a fake `claude auth login`
+        that lands the slot's account in the temporary profile."""
+        email = "work@co.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": email, "uuid": "u2", "organizationUuid": "",
+            "organizationName": "", "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        switcher._write_account_credentials("2", email, json.dumps({
+            "claudeAiOauth": {"accessToken": "old", "refreshToken": "old-rt", "expiresAt": 1},
+        }))
+        new_creds = json.dumps({
+            "claudeAiOauth": {"accessToken": "new", "refreshToken": "new-rt",
+                              "expiresAt": 9999999999999},
+        })
+
+        class Child:
+            def __init__(self, argv, env):
+                profile = Path(env["CLAUDE_CONFIG_DIR"])
+                (profile / ".credentials.json").write_text(new_creds)
+                (profile / ".claude.json").write_text(json.dumps(
+                    {"oauthAccount": {"emailAddress": email, "accountUuid": "u2"}}
+                ))
+                self.returncode = None
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+        with patch("claude_swap.session._start_login_child", Child), \
+             patch("claude_swap.session.shutil.which", return_value="/fake/claude"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "login", "2", "--json"]):
+            cli.main()
+
+        assert _last_json_line(capsys.readouterr().out) == {
+            "schemaVersion": 1, "ok": True, "outcome": "updated",
+            "number": 2, "email": email,
+        }
+        assert switcher.read_account_credentials("2", email) == new_creds
+        assert list(switcher.backup_dir.glob("login-*")) == []
+
+    def test_main_help_mentions_login(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "login <num|email>" in result.stdout
+        assert "login --new" in result.stdout
+
+
+class TestRemoveScripted:
+    """`cswap remove NUM|EMAIL --yes [--json]` (claude-swap-3uj §4.2)."""
+
+    def _seed(self, active: int = 1) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"] = {
+            "1": {"email": "dup@x.com", "uuid": "u1", "organizationUuid": "org-a",
+                  "organizationName": "A", "added": "2024-01-01T00:00:00Z"},
+            "2": {"email": "dup@x.com", "uuid": "u2", "organizationUuid": "",
+                  "organizationName": "", "added": "2024-01-01T00:00:00Z"},
+            "3": {"email": "solo@x.com", "uuid": "u3", "organizationUuid": "",
+                  "organizationName": "", "added": "2024-01-01T00:00:00Z"},
+        }
+        data["sequence"] = [1, 2, 3]
+        data["activeAccountNumber"] = active
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def _main(self, argv):
+        def no_prompt(*args, **kwargs):
+            raise AssertionError("scripted remove must not prompt")
+
+        with patch("builtins.input", no_prompt), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+
+    def test_json_removes_without_a_prompt(self, temp_home, capsys):
+        switcher = self._seed()
+
+        self._main(["remove", "3", "--yes", "--json"])
+
+        assert _last_json_line(capsys.readouterr().out) == {
+            "schemaVersion": 1, "ok": True,
+            "removed": {"number": 3, "email": "solo@x.com"},
+        }
+        assert "3" not in switcher._get_sequence_data()["accounts"]
+
+    def test_ambiguous_email_fails_without_asking(self, temp_home, capsys):
+        switcher = self._seed()
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._main(["rm", "dup@x.com", "--yes", "--json"])
+
+        assert excinfo.value.code == 1
+        payload = _last_json_line(capsys.readouterr().out)
+        assert (payload["ok"], payload["error"]) == (False, "ambiguous_account")
+        assert sorted(switcher._get_sequence_data()["accounts"]) == ["1", "2", "3"]
+
+    def test_unknown_account(self, temp_home, capsys):
+        self._seed()
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._main(["remove", "9", "--yes", "--json"])
+
+        assert excinfo.value.code == 1
+        assert _last_json_line(capsys.readouterr().out)["error"] == "account_not_found"
+
+    def test_active_account_warns_and_proceeds(self, temp_home, capsys):
+        switcher = self._seed(active=3)
+
+        self._main(["remove", "3", "--yes", "--json"])
+
+        out = capsys.readouterr().out
+        assert "currently active" in out
+        assert _last_json_line(out)["ok"] is True
+        assert "3" not in switcher._get_sequence_data()["accounts"]
+
+    def test_yes_without_json_is_human_only(self, temp_home, capsys):
+        switcher = self._seed()
+
+        self._main(["remove", "3", "--yes"])
+
+        out = capsys.readouterr().out
+        assert "Removed" in out and "{" not in out
+        assert "3" not in switcher._get_sequence_data()["accounts"]
+
+    def test_json_without_yes_is_a_usage_error(self, temp_home, capsys):
+        switcher = self._seed()
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._main(["remove", "3", "--json"])
+
+        assert excinfo.value.code == 2
+        assert "--json needs --yes" in capsys.readouterr().err
+        assert "3" in switcher._get_sequence_data()["accounts"]
+
+    def test_switch_json_envelope_still_names_config_error(self, temp_home, capsys):
+        """The ambiguity's code rides on the instance: `switch --json`'s
+        envelope keeps naming the class it always named."""
+        self._seed()
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._main(["switch", "dup@x.com", "--json"])
+
+        assert excinfo.value.code == 1
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["error"]["type"] == "ConfigError"
+        assert "ambiguous" in envelope["error"]["message"]
+
+    def test_plain_remove_keeps_the_interactive_prompt(self, temp_home):
+        switcher = self._seed()
+        prompts = []
+
+        def answer(prompt=""):
+            prompts.append(prompt)
+            return "y"
+
+        with patch("builtins.input", answer), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None), \
+             patch.object(sys, "argv", ["claude-swap", "remove", "3"]):
+            cli.main()
+
+        assert len(prompts) == 1 and "permanently remove" in prompts[0]
+        assert "3" not in switcher._get_sequence_data()["accounts"]

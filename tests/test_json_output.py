@@ -877,3 +877,34 @@ class TestUsageFromJson:
 
         with pytest.raises(ValueError):
             usage_from_json(usage)
+
+
+class TestScriptedCommandPayloads:
+    """`cswap login` / `cswap remove --yes --json` lines (claude-swap-3uj)."""
+
+    def test_login_success(self):
+        from claude_swap.json_output import login_success
+
+        assert login_success("added", 3, "n@x.com") == {
+            "schemaVersion": SCHEMA_VERSION, "ok": True, "outcome": "added",
+            "number": 3, "email": "n@x.com",
+        }
+
+    def test_remove_success(self):
+        from claude_swap.json_output import remove_success
+
+        assert remove_success(2, "a@x.com") == {
+            "schemaVersion": SCHEMA_VERSION, "ok": True,
+            "removed": {"number": 2, "email": "a@x.com"},
+        }
+
+    def test_failure(self):
+        from claude_swap.json_output import command_failure
+
+        payload = command_failure("identity_mismatch", "not the slot's account")
+        assert payload == {
+            "schemaVersion": SCHEMA_VERSION, "ok": False,
+            "error": "identity_mismatch", "message": "not the slot's account",
+        }
+        # One unindented line is what the CLI prints.
+        assert "\n" not in json.dumps(payload)
