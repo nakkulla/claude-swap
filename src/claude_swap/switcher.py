@@ -3884,6 +3884,15 @@ class ClaudeAccountSwitcher:
                         "login; nothing was saved.",
                     )
             if account_num is not None:
+                # Email and org pick the slot (``--new`` included); a different
+                # account id under them is another account all the same.
+                slot_uuid = (data["accounts"][account_num].get("uuid") or "").strip()
+                if slot_uuid and account_uuid and slot_uuid != account_uuid:
+                    raise LoginFailure(
+                        "identity_mismatch",
+                        f"The login is {email}, but its account id is not the "
+                        f"one Account-{account_num} stores; nothing was saved.",
+                    )
                 reason = self._isolated_login_unsupported(account_num, email)
                 if reason:
                     raise LoginFailure("unsupported_account", reason)
@@ -3892,6 +3901,24 @@ class ClaudeAccountSwitcher:
                 account_num is not None
                 and self._get_current_account() == (email, org_uuid)
             )
+            if (
+                active
+                and self.platform == Platform.MACOS
+                and (
+                    os.environ.get("CLAUDE_CONFIG_DIR")
+                    or os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+                )
+            ):
+                # The active write targets the default profile's Keychain item
+                # (and a file-mode write deletes it), while the live login and
+                # its identity follow these variables. Refreshing in place
+                # would overwrite the default profile's login, another account's.
+                raise LoginFailure(
+                    "login_failed",
+                    "The live login is in the store CLAUDE_CONFIG_DIR / "
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR selects, which cswap cannot "
+                    "refresh in place. Unset them and retry; nothing was saved.",
+                )
             if active:
                 live = self._read_credentials()
                 if live is None:

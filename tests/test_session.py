@@ -4420,6 +4420,49 @@ class TestIsolatedLogin:
         assert exc.value.code == "identity_mismatch"
         assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == CREDS
 
+    def test_new_matching_a_slot_of_another_account_id_saves_nothing(
+        self, manager, seeded_switcher, login_child, block_real_keychain
+    ):
+        """Email and org pick the slot; a different account id is still
+        another account, and its credential must not land under the old id."""
+        login_child.on_wait = _land_login(uuid="uuid-recreated")
+        sequence = seeded_switcher.sequence_file.read_text()
+        keychain = dict(block_real_keychain.data)
+
+        with pytest.raises(session_mod.LoginFailure) as exc:
+            manager.isolated_login(None)
+
+        assert exc.value.code == "identity_mismatch"
+        assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == CREDS
+        assert seeded_switcher.read_account_config(ACCOUNT_NUM, ACCOUNT_EMAIL) == CONFIG
+        assert seeded_switcher.sequence_file.read_text() == sequence
+        assert block_real_keychain.data == keychain
+        assert _login_profiles(seeded_switcher) == []
+
+    def test_target_account_id_replaced_during_the_ownership_check(
+        self, manager, seeded_switcher, login_child, monkeypatch
+    ):
+        """The account id is checked again under the lock: the network
+        ownership check runs after the unlocked one and before the lock."""
+
+        def replace_uuid_then_unresolved(token):
+            data = seeded_switcher._get_sequence_data()
+            data["accounts"][ACCOUNT_NUM]["uuid"] = "uuid-replaced"
+            seeded_switcher._write_json(seeded_switcher.sequence_file, data)
+            return None
+
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile", replace_uuid_then_unresolved
+        )
+
+        with pytest.raises(session_mod.LoginFailure) as exc:
+            manager.isolated_login("2")
+
+        assert exc.value.code == "identity_mismatch"
+        assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == CREDS
+        assert seeded_switcher.read_account_config(ACCOUNT_NUM, ACCOUNT_EMAIL) == CONFIG
+        assert seeded_switcher.account_identity(ACCOUNT_NUM)["uuid"] == "uuid-replaced"
+
     @pytest.mark.parametrize("ends_active", [True, False])
     def test_a_switch_during_the_login_decides_the_active_write(
         self, manager, seeded_switcher, login_child, ends_active
@@ -4481,6 +4524,60 @@ class TestIsolatedLogin:
         assert block_real_keychain.data[decoy_item] == decoy
         assert os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == value
         assert "CLAUDE_CONFIG_DIR" not in os.environ
+
+    @pytest.mark.parametrize("config_dir,secure,keychain_usable", [
+        (True, None, True),
+        (True, "", True),  # the secure store pinned to the default item
+        (True, "other", True),
+        (False, "other", True),
+        (True, None, False),  # file mode still deletes the default item
+    ])
+    def test_active_login_in_another_profiles_store_is_refused(
+        self, manager, seeded_switcher, login_child, block_real_keychain,
+        temp_home, monkeypatch, config_dir, secure, keychain_usable,
+    ):
+        """The active write goes to the default profile's store only. When the
+        environment points the live login elsewhere, refreshing it would
+        overwrite the default profile's login (another account's) instead."""
+        other = temp_home / "other-profile"
+        other.mkdir()
+        other_item = (keychain_service_name(other), session_mod._keychain_account_name())
+        other_live = json.dumps(
+            {"claudeAiOauth": {"accessToken": "other-live", "refreshToken": "other-live-r"}}
+        )
+        block_real_keychain.data[other_item] = other_live
+        if config_dir:
+            # The default profile is account 1; the profile the env names is
+            # the target.
+            _make_live(seeded_switcher, "account1@example.com", "org-uuid-1", "uuid-1", LIVE_1_CREDS)
+            (other / ".claude.json").write_text(json.dumps({"oauthAccount": {
+                "emailAddress": ACCOUNT_EMAIL, "organizationUuid": ORG_UUID,
+                "accountUuid": "uuid-2",
+            }}))
+            monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
+        else:
+            _make_live(seeded_switcher, ACCOUNT_EMAIL, ORG_UUID, "uuid-2", LIVE_1_CREDS)
+        if secure is not None:
+            monkeypatch.setenv(
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR", str(other) if secure else ""
+            )
+        if not keychain_usable:
+            seeded_switcher._keychain_usable_cache = False  # an earlier op failed
+        default_item = (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
+        sequence = seeded_switcher.sequence_file.read_text()
+
+        with pytest.raises(session_mod.LoginFailure) as exc:
+            manager.isolated_login("2")
+
+        assert exc.value.code == "login_failed"
+        assert "nothing was saved" in str(exc.value)
+        assert block_real_keychain.data[default_item] == LIVE_1_CREDS
+        assert block_real_keychain.data[other_item] == other_live
+        assert not (other / ".credentials.json").exists()
+        assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == CREDS
+        assert seeded_switcher.read_account_config(ACCOUNT_NUM, ACCOUNT_EMAIL) == CONFIG
+        assert seeded_switcher.sequence_file.read_text() == sequence
+        assert _login_profiles(seeded_switcher) == []
 
     def test_failed_login_cleans_up(
         self, manager, seeded_switcher, login_child, block_real_keychain
