@@ -8638,6 +8638,61 @@ class TestSwitchRemoveGatesAcceptAlias:
             switcher.remove_account("not an email or alias!")
 
 
+class TestRemoveAccountAssumeYes:
+    """`remove_account(assume_yes=True)` never prompts (claude-swap-3uj §4.2)."""
+
+    def _switcher(self, sample_sequence_data_with_org: dict) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data_with_org)
+        return switcher
+
+    def test_ambiguous_email_raises_instead_of_asking(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch,
+    ):
+        from claude_swap.switcher import AmbiguousAccountError
+
+        switcher = self._switcher(sample_sequence_data_with_org)
+
+        def no_prompt(*args, **kwargs):
+            raise AssertionError("assume_yes must not prompt")
+
+        monkeypatch.setattr("builtins.input", no_prompt)
+        with pytest.raises(AmbiguousAccountError) as exc:
+            switcher.remove_account("user@example.com", assume_yes=True)
+
+        assert isinstance(exc.value, ConfigError)
+        assert exc.value.code == "ambiguous_account"
+        assert sorted(switcher._get_sequence_data()["accounts"]) == ["1", "2"]
+
+    def test_returns_the_removed_account(
+        self, temp_home: Path, sample_sequence_data_with_org: dict,
+    ):
+        switcher = self._switcher(sample_sequence_data_with_org)
+
+        assert switcher.remove_account("2", assume_yes=True) == ("2", "user@example.com")
+        assert list(switcher._get_sequence_data()["accounts"]) == ["1"]
+
+    def test_interactive_pick_is_unchanged(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch,
+    ):
+        switcher = self._switcher(sample_sequence_data_with_org)
+        answers = iter(["2", "y"])
+        monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+
+        assert switcher.remove_account("user@example.com") == ("2", "user@example.com")
+
+    def test_resolve_account_raises_the_ambiguity_subclass(
+        self, temp_home: Path, sample_sequence_data_with_org: dict,
+    ):
+        from claude_swap.switcher import AmbiguousAccountError
+
+        switcher = self._switcher(sample_sequence_data_with_org)
+
+        with pytest.raises(AmbiguousAccountError):
+            switcher.resolve_account("user@example.com")
+
+
 class TestAddAccountAlias:
     """Test the --alias convenience at add time, and preservation on re-add."""
 

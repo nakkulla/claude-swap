@@ -366,3 +366,38 @@ def error_envelope(exc: Exception) -> dict:
         "schemaVersion": SCHEMA_VERSION,
         "error": {"type": type(exc).__name__, "message": str(exc)},
     }
+
+
+# Scripted commands (``cswap login``, ``cswap remove --yes``) end with ONE
+# unindented JSON line, success or failure; ``ok`` tells them apart and
+# ``error`` is a stable code scripts branch on (``message`` is for people).
+
+
+def command_failure(code: str, message: str) -> dict:
+    """The failure line of a scripted command."""
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "ok": False,
+        "error": code,
+        "message": message,
+    }
+
+
+def login_success(outcome: str, number: int, email: str) -> dict:
+    """``cswap login``'s success line; ``outcome`` is ``updated`` or ``added``."""
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "ok": True,
+        "outcome": outcome,
+        "number": number,
+        "email": email,
+    }
+
+
+def remove_success(number: int, email: str) -> dict:
+    """``cswap remove --yes --json``'s success line."""
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "ok": True,
+        "removed": account_ref(number, email),
+    }

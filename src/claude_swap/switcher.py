@@ -304,6 +304,13 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 
 
 
+class AmbiguousAccountError(ConfigError):
+    """An email identifier matches more than one slot. ``code`` is its
+    ``--json`` error code (``cswap login`` / ``remove --yes``)."""
+
+    code = "ambiguous_account"
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -3409,7 +3416,8 @@ class ClaudeAccountSwitcher:
         Resolution precedence: number -> alias -> email.
 
         Raises:
-            ConfigError: if the email matches multiple accounts (ambiguous).
+            AmbiguousAccountError: (a ConfigError) if the email matches
+                multiple accounts.
         """
         if identifier.isdigit():
             return identifier
@@ -3436,7 +3444,7 @@ class ClaudeAccountSwitcher:
             f"{num} [{data['accounts'][num].get('organizationName') or 'personal'}]"
             for num in matches
         )
-        raise ConfigError(
+        raise AmbiguousAccountError(
             f"Email '{identifier}' is ambiguous — matches accounts: {details}. "
             f"Use account number instead (e.g., cswap --switch-to 1)."
         )
@@ -3770,6 +3778,173 @@ class ClaudeAccountSwitcher:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
+    def _isolated_login_unsupported(self, account_num: str, email: str) -> str | None:
+        """Why ``cswap login`` cannot log this slot in, or None.
+
+        The rule of ``cswap session login``: an API-key or setup-token slot
+        holds no claude.ai login to replace.
+        """
+        from claude_swap.session import SessionManager
+
+        if self._account_kind(account_num) == "api_key":
+            return (
+                f"Account-{account_num} ({email}) is an API-key account; "
+                "`cswap login` needs a claude.ai login."
+            )
+        stored = self._read_account_credentials(account_num, email)
+        if stored and not SessionManager._has_refresh_token(stored):
+            return (
+                f"Account-{account_num} ({email}) is a setup-token account; "
+                "`cswap login` needs a claude.ai login."
+            )
+        return None
+
+    def save_isolated_login(
+        self,
+        profile_config: str,
+        credentials: str,
+        target: tuple[str, str, str] | None = None,
+    ) -> tuple[str, str, str, bool]:
+        """Store a login made in ``cswap login``'s temporary profile.
+
+        ``profile_config`` and ``credentials`` are that profile's
+        ``.claude.json`` text and credential, read by explicit path: the
+        env-following readers ``add_account`` uses would answer for the active
+        profile. ``target`` is the ``(account_num, email, org_uuid)`` the login
+        was for, or None for ``--new``. Returns ``(outcome, account_num, email,
+        active_refreshed)`` with outcome ``"updated"`` or ``"added"``.
+
+        ``add_account``'s capture checks (managed API key, foreign credential)
+        run first, outside the locks because the second one is network. The
+        save then holds the switch's locks in the switch's order and re-reads
+        the roster, the target slot and the live identity under them.
+        ``activeAccountNumber`` is never written. When the live login is the
+        saved account, the active store gets the new credential as well,
+        through ``_write_credentials``: ``_perform_switch`` would first back the
+        old active credential up over the slot just saved. That write comes
+        before the slot's, so a failure leaves nothing changed; a slot saved
+        without it would get the old credential back at the next switch away.
+        """
+        from claude_swap.session import LoginFailure
+
+        try:
+            config = json.loads(profile_config) if profile_config else None
+        except json.JSONDecodeError:
+            config = None
+        oauth_account = config.get("oauthAccount") if isinstance(config, dict) else None
+        if not isinstance(oauth_account, dict) or not oauth_account.get("emailAddress"):
+            raise LoginFailure(
+                "login_incomplete",
+                "`claude auth login` finished without recording an account; "
+                "nothing was saved.",
+            )
+        email = oauth_account["emailAddress"]
+        org_uuid = oauth_account.get("organizationUuid", "") or ""
+        account_uuid = oauth_account.get("accountUuid", "") or ""
+        if target is not None:
+            slot_uuid = self.account_identity(target[0])["uuid"]
+            if (email, org_uuid) != (target[1], target[2]) or (
+                slot_uuid and account_uuid and slot_uuid != account_uuid
+            ):
+                raise LoginFailure(
+                    "identity_mismatch",
+                    f"The login is {email} [{org_uuid or 'personal'}], not "
+                    f"Account-{target[0]} ({target[1]} "
+                    f"[{target[2] or 'personal'}]); nothing was saved.",
+                )
+        try:
+            self._reject_live_api_key_capture(credentials)
+            credentials = self._reject_foreign_credential_capture(
+                credentials, email, org_uuid, account_uuid
+            )
+        except ValidationError as e:
+            raise LoginFailure("unsupported_account", str(e)) from e
+        except ConfigError as e:
+            raise LoginFailure("identity_mismatch", str(e)) from e
+
+        self._setup_directories()
+        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+            self._init_sequence_file()
+            self._migrate_org_fields()
+            data = self._get_sequence_data()
+            if target is None:
+                account_num = self._find_account_slot(data, email, org_uuid)
+            else:
+                account_num = target[0]
+                record = data.get("accounts", {}).get(account_num)
+                if record is None:
+                    raise LoginFailure(
+                        "account_not_found",
+                        f"Account-{account_num} was removed during the login; "
+                        "nothing was saved.",
+                    )
+                now = (record.get("email", ""), record.get("organizationUuid", "") or "")
+                if now != (target[1], target[2]):
+                    raise LoginFailure(
+                        "identity_mismatch",
+                        f"Account-{account_num} became {now[0]} during the "
+                        "login; nothing was saved.",
+                    )
+            if account_num is not None:
+                reason = self._isolated_login_unsupported(account_num, email)
+                if reason:
+                    raise LoginFailure("unsupported_account", reason)
+
+            active = (
+                account_num is not None
+                and self._get_current_account() == (email, org_uuid)
+            )
+            if active:
+                live = self._read_credentials()
+                if live is None:
+                    raise CredentialReadError(
+                        "Could not read the active login to refresh it; "
+                        "nothing was saved."
+                    )
+                self._write_credentials(
+                    self._prepare_credentials_for_activation(credentials, live)
+                )
+
+            outcome = "updated" if account_num is not None else "added"
+            config_text = profile_config
+            if account_num is None:
+                account_num = str(self._get_next_account_number())
+            else:
+                # Keep the slot's stored config (the full-config fallback a
+                # switch writes when ~/.claude.json is unusable, the session
+                # theme) and refresh only its identity; the temporary
+                # profile's own config is close to empty.
+                try:
+                    stored = json.loads(self._read_account_config(account_num, email) or "null")
+                except json.JSONDecodeError:
+                    stored = None
+                if isinstance(stored, dict):
+                    stored["oauthAccount"] = oauth_account
+                    config_text = json.dumps(stored, indent=2)
+            self._write_account_credentials(account_num, email, credentials)
+            self._write_account_config(account_num, email, config_text)
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (email, org_uuid)}
+            )
+            if outcome == "added":
+                data["accounts"][account_num] = {
+                    "email": email,
+                    "uuid": account_uuid,
+                    "organizationUuid": org_uuid,
+                    "organizationName": oauth_account.get("organizationName", "") or "",
+                    "added": get_timestamp(),
+                }
+                if int(account_num) not in data["sequence"]:
+                    data["sequence"].append(int(account_num))
+                    data["sequence"].sort()
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+        self._logger.info(
+            f"cswap login {outcome} account {account_num}: {email}"
+            f"{' (active login refreshed)' if active else ''}"
+        )
+        return outcome, account_num, email, active
+
     def add_account_from_token(
         self,
         token: str,
@@ -3978,11 +4153,16 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
-    def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
+    def remove_account(
+        self, identifier: str, assume_yes: bool = False
+    ) -> tuple[str, str] | None:
         """Remove account from managed accounts.
 
         When ``assume_yes`` is True the confirmation prompt is skipped (used by
-        the TUI, which collects confirmation before calling).
+        the TUI, which collects confirmation before calling, and by
+        ``cswap remove --yes``), and an ambiguous email raises
+        ``AmbiguousAccountError`` instead of asking which slot. Returns the
+        removed ``(account_num, email)``, or None when the prompt cancelled.
         """
         self._refuse_session_shell()
         if not self.sequence_file.exists():
@@ -3997,9 +4177,11 @@ class ClaudeAccountSwitcher:
             if not is_alias and not self._validate_email(identifier):
                 raise ValidationError(f"Invalid account identifier: {identifier}")
 
-            # For email identifiers, handle ambiguous matches interactively.
+            # For email identifiers, handle ambiguous matches interactively —
+            # except under assume_yes, where nobody answers: fall through to
+            # _resolve_account_identifier, which raises AmbiguousAccountError.
             # Aliases are unique by construction, so they never hit this.
-            if not is_alias:
+            if not assume_yes and not is_alias:
                 data = self._get_sequence_data()
                 matches = [
                     num for num, acc in (data or {}).get("accounts", {}).items()
@@ -4065,6 +4247,7 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
+        return account_num, email
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).

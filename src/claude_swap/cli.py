@@ -9,8 +9,17 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import error_envelope
+from claude_swap.exceptions import (
+    AccountNotFoundError,
+    ClaudeSwitchError,
+    ValidationError,
+)
+from claude_swap.json_output import (
+    command_failure,
+    error_envelope,
+    login_success,
+    remove_success,
+)
 from claude_swap.printer import (
     accent,
     bolded,
@@ -288,6 +297,188 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _error_code(exc: BaseException, default: str) -> str:
+    """The stable ``--json`` error code of a scripted command's failure."""
+    code = getattr(exc, "code", None) if isinstance(exc, ClaudeSwitchError) else None
+    if isinstance(code, str):
+        return code
+    if isinstance(exc, AccountNotFoundError):
+        return "account_not_found"
+    return default
+
+
+def _print_json_line(payload: dict) -> None:
+    """A scripted command's result: one unindented line, stdout's last."""
+    try:
+        print(json.dumps(payload), flush=True)
+    except OSError:
+        pass  # the terminal is gone (a closed tmux window); nobody can read it
+
+
+def _run_scripted(
+    json_mode: bool, codes: tuple[str, str], action
+) -> tuple[dict, int]:
+    """Run a scripted command's ``action`` (returns its success payload).
+
+    Turns every handled failure into ``(failure payload, exit code)`` so the
+    command can still end with its JSON line. ``codes`` is the
+    ``(failure, cancel)`` error code pair. An unexpected exception prints the
+    failure line and propagates — a blanket catch would hide bugs, and the
+    test suite's real-store guard is deliberately not an ``OSError``.
+    """
+    failed, cancelled = codes
+    try:
+        return action(), 0
+    except (ClaudeSwitchError, OSError) as e:
+        if not json_mode:
+            error(f"Error: {e}")
+        return command_failure(_error_code(e, failed), str(e)), 1
+    except KeyboardInterrupt:
+        if not json_mode:
+            print(f"\n{dimmed('Operation cancelled')}")
+        return command_failure(cancelled, "Cancelled."), 130
+    except Exception as e:
+        if json_mode:
+            _print_json_line(command_failure(failed, f"Unexpected error: {e!r}"))
+        raise
+
+
+def _refuse_root(switcher: ClaudeAccountSwitcher) -> None:
+    """``_guard_root`` as an exception, so a scripted command reports it."""
+    if sys.platform != "win32":
+        if os.geteuid() == 0 and not switcher._is_running_in_container():
+            raise ValidationError(
+                "Do not run this script as root (unless running in a container)"
+            )
+
+
+def _login_command(argv: list[str]) -> None:
+    """Handle `cswap login NUM|EMAIL [--json]` and `cswap login --new [--json]`.
+
+    Logs an account in inside a temporary profile and stores the login in its
+    slot without switching: the active login and the recorded active account
+    stay as they are, so sessions and Workers running on them carry on.
+    Pre-dispatched like `session`. With --json the last stdout line is one
+    JSON object on every path (success, failure, cancel); the login itself
+    keeps the terminal, so its URL and code prompt show as usual.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} login",
+        description=(
+            "Log a stored account in again, or add a new one, without "
+            "changing the active login. The login runs in a temporary "
+            "profile that is deleted afterwards."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap login 2
+  cswap login user@example.com --json
+  cswap login --new
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to log in again (number, email or alias)",
+    )
+    parser.add_argument(
+        "--new",
+        action="store_true",
+        help="Log in an account that is not stored yet (a stored one is updated)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="End with one machine-readable JSON line on stdout",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if args.new == (args.account is not None):
+        parser.error("give either NUM|EMAIL or --new")
+
+    leftovers: list[str] = []
+
+    def action() -> dict:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _refuse_root(switcher)
+        from claude_swap.session import SessionManager
+
+        outcome, num, email, active = SessionManager(switcher).isolated_login(
+            None if args.new else args.account, leftovers
+        )
+        if outcome == "added":
+            print(f"{accent('Added')} Account {num}: {email}")
+        else:
+            print(f"{accent('Updated credentials')} for Account {num} ({email})")
+        print(dimmed(
+            "It is the active account, so the active login got the new "
+            "credentials too." if active else "The active login was not changed."
+        ))
+        return login_success(outcome, int(num), email)
+
+    payload, exit_code = _run_scripted(
+        args.json, ("login_failed", "login_incomplete"), action
+    )
+    if leftovers:
+        note = (
+            "Could not remove the temporary login profile "
+            f"{', '.join(leftovers)}; delete it by hand."
+        )
+        payload["message"] = f"{payload['message']} {note}" if "message" in payload else note
+        if not args.json:
+            warning(note)
+    if args.json:
+        _print_json_line(payload)
+    if exit_code:
+        sys.exit(exit_code)
+
+
+def _remove_command(argv: list[str]) -> None:
+    """Handle `cswap remove NUM|EMAIL --yes [--json]` (and `rm`).
+
+    The scripted removal: no confirmation prompt, and an email matching more
+    than one slot fails instead of asking which. Pre-dispatched only when
+    --yes or --json is given, so the interactive `cswap remove` keeps its path
+    through the main parser. With --json the last stdout line is one JSON
+    object.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} remove",
+        description="Remove a stored account without the confirmation prompt.",
+    )
+    parser.add_argument(
+        "account", metavar="NUM|EMAIL", help="Account to remove (number, email or alias)"
+    )
+    parser.add_argument("--yes", action="store_true", help="Remove without asking")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="End with one machine-readable JSON line on stdout (needs --yes)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if not args.yes:
+        parser.error("--json needs --yes: a script cannot answer the confirmation prompt")
+
+    def action() -> dict:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _refuse_root(switcher)
+        removed = switcher.remove_account(args.account, assume_yes=True)
+        if removed is None:  # only a prompt cancels, and --yes asks none
+            raise ValidationError(f"Account {args.account} was not removed.")
+        return remove_success(int(removed[0]), removed[1])
+
+    payload, exit_code = _run_scripted(
+        args.json, ("remove_failed", "remove_failed"), action
+    )
+    if args.json:
+        _print_json_line(payload)
+    if exit_code:
+        sys.exit(exit_code)
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1060,6 +1251,14 @@ def main() -> None:
     if argv and argv[0] == "session":
         _session_command(argv[1:])
         return
+    if argv and argv[0] == "login":
+        _login_command(argv[1:])
+        return
+    # Only the scripted spellings; a plain `cswap remove N` keeps the main
+    # parser's interactive path.
+    if argv and argv[0] in ("remove", "rm") and {"--yes", "--json"} & set(argv[1:]):
+        _remove_command(argv[1:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1106,7 +1305,10 @@ Commands:
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
+  %(prog)s login <num|email>          log an account in again, active login untouched
+  %(prog)s login --new                add an account the same way
   %(prog)s remove <num|email>         remove an account
+  %(prog)s remove <num|email> --yes   remove without the prompt (--json for scripts)
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
